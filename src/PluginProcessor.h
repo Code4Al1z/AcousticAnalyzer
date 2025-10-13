@@ -2,6 +2,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
+#include <vector>
 
 //==============================================================================
 class AudioPluginAudioProcessor : public juce::AudioProcessor
@@ -41,6 +42,14 @@ public:
     float getTemporalUnpredictability() const { return temporalUnpredictability.load(); }
     float getAcousticActivationScore() const { return acousticActivationScore.load(); }
 
+    // Data logging functions
+    void startLogging();
+    void stopLogging();
+    bool isCurrentlyLogging() const { return isLogging.load(); }
+    void exportToCSV();
+    double getRecordingTime() const;
+    int getDataPointCount() const { return static_cast<int>(dataLog.size()); }
+
 private:
     // FFT setup
     static constexpr int fftOrder = 11;
@@ -66,6 +75,23 @@ private:
 
     double currentSampleRate = 44100.0;
 
+    // Data logging
+    struct DataPoint
+    {
+        double timestamp;
+        float activationScore;
+        float spectralCentroid;
+        float spectralHarshness;
+        float dynamicVariability;
+        float temporalUnpredictability;
+        float rmsLevel;
+    };
+
+    std::vector<DataPoint> dataLog;
+    std::atomic<bool> isLogging{ false };
+    juce::int64 loggingStartTime = 0;
+    juce::CriticalSection dataLogLock;
+
     // Analysis functions
     void performFFTAnalysis();
     void calculateSpectralCentroid();
@@ -73,6 +99,7 @@ private:
     void calculateDynamicVariability();
     void calculateTemporalUnpredictability();
     void calculateAcousticActivationScore();
+    void logDataPoint();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioPluginAudioProcessor)
 };

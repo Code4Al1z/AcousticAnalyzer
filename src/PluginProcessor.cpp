@@ -75,6 +75,12 @@ void AudioPluginAudioProcessor::performFFTAnalysis()
     calculateDynamicVariability();
     calculateTemporalUnpredictability();
     calculateAcousticActivationScore();
+
+    // Log data if recording
+    if (isLogging.load())
+    {
+        logDataPoint();
+    }
 }
 
 void AudioPluginAudioProcessor::calculateSpectralCentroid()
@@ -178,6 +184,111 @@ void AudioPluginAudioProcessor::calculateAcousticActivationScore()
         unpredictScore * 0.20f);
 
     acousticActivationScore.store(juce::jlimit(0.0f, 100.0f, score));
+}
+
+void AudioPluginAudioProcessor::startLogging()
+{
+    juce::ScopedLock lock(dataLogLock);
+    dataLog.clear();
+    loggingStartTime = juce::Time::currentTimeMillis();
+    isLogging.store(true);
+}
+
+void AudioPluginAudioProcessor::stopLogging()
+{
+    isLogging.store(false);
+}
+
+void AudioPluginAudioProcessor::logDataPoint()
+{
+    juce::ScopedLock lock(dataLogLock);
+
+    double currentTime = (juce::Time::currentTimeMillis() - loggingStartTime) / 1000.0;
+
+    DataPoint point;
+    point.timestamp = currentTime;
+    point.activationScore = acousticActivationScore.load();
+    point.spectralCentroid = spectralCentroid.load();
+    point.spectralHarshness = spectralHarshness.load();
+    point.dynamicVariability = dynamicVariability.load();
+    point.temporalUnpredictability = temporalUnpredictability.load();
+    point.rmsLevel = rmsLevel.load();
+
+    dataLog.push_back(point);
+}
+
+double AudioPluginAudioProcessor::getRecordingTime() const
+{
+    if (!isLogging.load())
+        return 0.0;
+
+    return (juce::Time::currentTimeMillis() - loggingStartTime) / 1000.0;
+}
+
+void AudioPluginAudioProcessor::exportToCSV()
+{
+    juce::ScopedLock lock(dataLogLock);
+
+    if (dataLog.empty())
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+            "No Data",
+            "No data to export. Please record data first.",
+            "OK");
+        return;
+    }
+
+    // Create CSV content first (before the async callback)
+    juce::String csvContent = "Timestamp_Seconds,Activation_Score,Spectral_Centroid,Spectral_Harshness,Dynamic_Variability,Temporal_Unpredictability,RMS_Level\n";
+
+    for (const auto& point : dataLog)
+    {
+        csvContent += juce::String(point.timestamp, 3) + ",";
+        csvContent += juce::String(point.activationScore, 2) + ",";
+        csvContent += juce::String(point.spectralCentroid, 4) + ",";
+        csvContent += juce::String(point.spectralHarshness, 4) + ",";
+        csvContent += juce::String(point.dynamicVariability, 4) + ",";
+        csvContent += juce::String(point.temporalUnpredictability, 4) + ",";
+        csvContent += juce::String(point.rmsLevel, 6) + "\n";
+    }
+
+    int totalPoints = static_cast<int>(dataLog.size());
+
+    // Create file chooser on the heap (it will manage its own lifetime)
+    auto chooser = std::make_shared<juce::FileChooser>(
+        "Save CSV File",
+        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("acoustic_data.csv"),
+        "*.csv");
+
+    auto flags = juce::FileBrowserComponent::saveMode
+        | juce::FileBrowserComponent::canSelectFiles
+        | juce::FileBrowserComponent::warnAboutOverwriting;
+
+    chooser->launchAsync(flags, [csvContent, totalPoints, chooser](const juce::FileChooser& fc)
+        {
+            auto result = fc.getURLResult();
+            auto outputFile = result.getLocalFile();
+
+            if (outputFile != juce::File{})
+            {
+                // Write to file
+                if (outputFile.replaceWithText(csvContent))
+                {
+                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                        "Export Successful",
+                        "Data exported to:\n" + outputFile.getFullPathName() +
+                        "\n\nTotal data points: " + juce::String(totalPoints),
+                        "OK");
+                }
+                else
+                {
+                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                        "Export Failed",
+                        "Failed to write file. Check permissions.",
+                        "OK");
+                }
+            }
+        });
 }
 
 juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()
