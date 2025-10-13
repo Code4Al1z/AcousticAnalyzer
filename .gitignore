@@ -3,3 +3,40 @@ jumake_build/
 build/
 compile_commands.json
 .jumake
+
+# JUCE/Projucer
+*.jucer~
+*.jucer.user
+
+# JUCE build output
+Build/
+[Bb]uilds/
+out/
+
+# JUCE CMake (if applicable)
+CMakeBuild/
+cmake-build-*/
+CMakeLists.txt.user
+
+# IDE files
+.vs/
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.xcworkspace
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+*.idea/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*~
