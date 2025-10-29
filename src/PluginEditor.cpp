@@ -123,7 +123,7 @@ void AudioPluginAudioProcessorEditor::paint(juce::Graphics& g)
     // Disclaimer at bottom
     g.setFont(10.0f);
     g.setColour(juce::Colour(0xff888888));
-    g.drawText("Research tool in development - Measures acoustic arousal potential",
+    g.drawText("Research tool in development - Measures acoustic activation potential",
         20, getHeight() - 25, getWidth() - 40, 20, juce::Justification::centred);
 }
 
@@ -159,11 +159,11 @@ juce::Colour AudioPluginAudioProcessorEditor::getScoreColour(float score)
 juce::String AudioPluginAudioProcessorEditor::getInterpretationText(float score)
 {
     if (score > 70.0f)
-        return "Low Arousal - Calming";
+        return "Low Activation - Calming";
     else if (score > 40.0f)
-        return "Medium Arousal - Neutral";
+        return "Medium Activation - Neutral";
     else
-        return "High Arousal - Stimulating";
+        return "High Activation - Stimulating";
 }
 
 juce::String AudioPluginAudioProcessorEditor::formatTime(double seconds)
@@ -177,14 +177,14 @@ juce::String AudioPluginAudioProcessorEditor::formatTime(double seconds)
 
 void AudioPluginAudioProcessorEditor::drawMetricBar(juce::Graphics& g, const juce::String& label, float value, int y)
 {
-    int barX = 150;
-    int barWidth = getWidth() - barX - 40;
+    int barX = 190;
+    int barWidth = getWidth() - barX - 50;
     int barHeight = 20;
 
     // Label
     g.setColour(juce::Colours::white);
     g.setFont(14.0f);
-    g.drawText(label, 20, y, 120, barHeight, juce::Justification::left);
+    g.drawText(label, 20, y, 160, barHeight, juce::Justification::left);
 
     // Background bar
     g.setColour(juce::Colour(0xff333333));
