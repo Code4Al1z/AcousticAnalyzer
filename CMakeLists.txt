@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(ProsocialAudioAnalyzer VERSION 0.0.1)
+project(AcousticAnalyzer VERSION 0.0.1)
 
 # JUCE module paths (ensure JUCE is correctly included)
 add_subdirectory(modules/JUCE)
@@ -10,14 +10,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Define the plugin target
-juce_add_plugin(ProsocialAudioAnalyzer
+juce_add_plugin(AcousticAnalyzer
     COMPANY_NAME "Trailblaiz"
     PLUGIN_MANUFACTURER_CODE AL1Z
     PLUGIN_CODE AN01
     VERSION "${PROJECT_VERSION}"
-    DESCRIPTION "Real-time analyzer for prosocial acoustic environments. Measures spectral characteristics, dynamic patterns, and temporal features that influence human wellbeing, stress, and social behavior."
+    DESCRIPTION "Real-time analyzer for acoustic environments. Measures spectral characteristics, dynamic patterns, and temporal features that influence human wellbeing, stress, and social behavior."
     FORMATS AU VST3 AAX Standalone
-    PRODUCT_NAME "ProsocialAudioAnalyzer"
+    PRODUCT_NAME "AcousticAnalyzer"
 )
 
 # Globbing files
@@ -26,10 +26,10 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     "src/*.h"
 )
 
-target_sources(ProsocialAudioAnalyzer PRIVATE ${SOURCES})
+target_sources(AcousticAnalyzer PRIVATE ${SOURCES})
 
 # Include JUCE modules needed for the plugin
-target_link_libraries(ProsocialAudioAnalyzer PRIVATE
+target_link_libraries(AcousticAnalyzer PRIVATE
     juce::juce_audio_processors    # Core audio processing
     juce::juce_dsp                 # FFT and DSP functions
     juce::juce_gui_extra           # Extended GUI components
@@ -46,18 +46,18 @@ target_link_libraries(ProsocialAudioAnalyzer PRIVATE
 )
 
 # Set the standard C++ version
-target_compile_features(ProsocialAudioAnalyzer PUBLIC cxx_std_17)
+target_compile_features(AcousticAnalyzer PUBLIC cxx_std_17)
 
 # Generate JUCE header
-juce_generate_juce_header(ProsocialAudioAnalyzer)
+juce_generate_juce_header(AcousticAnalyzer)
 
 # Specify the location of the plugin's resources (icons, etc.)
-target_include_directories(ProsocialAudioAnalyzer PRIVATE
+target_include_directories(AcousticAnalyzer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/resources
 )
 
 # Optional: Add compile definitions for debugging
-target_compile_definitions(ProsocialAudioAnalyzer PUBLIC
+target_compile_definitions(AcousticAnalyzer PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
