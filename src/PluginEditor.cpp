@@ -132,7 +132,7 @@ void AudioPluginAudioProcessorEditor::resized()
     // Position buttons at the bottom
     int buttonWidth = 180;
     int buttonHeight = 30;
-    int buttonY = 430;
+    int buttonY = 400;
     int spacing = 10;
 
     int totalWidth = (buttonWidth * 3) + (spacing * 2);
