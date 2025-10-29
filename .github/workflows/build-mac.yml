@@ -1,0 +1,49 @@
+name: Build macOS plugins
+
+on:
+  push:
+    tags: ['v*', 'v*.*', 'v*.*.*']
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install CMake (if needed)
+        uses: jwlawson/actions-setup-cmake@v1
+
+      - name: Install dependencies (homebrew packages if you use any)
+        run: |
+          brew update || true
+          # brew install some-dep || true
+
+      - name: Configure with CMake (Xcode generator)
+        run: |
+          mkdir -p build
+          cd build
+          # generate an Xcode project so AU is available
+          cmake -G Xcode ..
+
+      - name: Build Release (Xcode)
+        run: |
+          cd build
+          # Build Release configuration
+          xcodebuild -project AcousticAnalyzer.xcodeproj -configuration Release -parallelizeTargets -jobs 4 build
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          # Adjust to where JUCE/CMake places built bundles
+          cp -R build/Release/AcousticAnalyzer.vst3 artifacts/ || true
+          cp -R build/Release/AcousticAnalyzer.component artifacts/ || true
+          cp -R build/Release/AcousticAnalyzer.aaxplugin artifacts/ || true
+          ls -la artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AcousticAnalyzer-macOS-${{ github.ref_name || github.run_id }}
+          path: artifacts
