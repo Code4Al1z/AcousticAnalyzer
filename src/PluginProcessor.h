@@ -7,7 +7,8 @@
 #include <vector>
 
 //==============================================================================
-class AudioPluginAudioProcessor : public juce::AudioProcessor
+class AudioPluginAudioProcessor : public juce::AudioProcessor,
+                                  private juce::Timer
 {
 public:
     AudioPluginAudioProcessor();
@@ -51,6 +52,7 @@ public:
     void exportToCSV();
     double getRecordingTime() const;
     int getDataPointCount() const { return static_cast<int>(dataLog.size()); }
+    int getDroppedPointCount() const { return droppedLogPoints.load(); }
 
 private:
     // FFT setup
@@ -101,10 +103,25 @@ private:
         float rmsLevel;
     };
 
+    // Recording is split across two threads so the audio thread never locks or allocates:
+    //  - audio thread: pushes DataPoints into a fixed-size lock-free FIFO
+    //  - message thread: drains the FIFO into dataLog (timer, stop and export)
+    // dataLog is only ever touched on the message thread.
+    static constexpr int logFifoCapacity = 4096; // ~3 minutes between drains at 44.1 kHz
+    juce::AbstractFifo logFifo{ logFifoCapacity };
+    std::array<DataPoint, logFifoCapacity> logFifoStorage{};
     std::vector<DataPoint> dataLog;
+    std::atomic<int> droppedLogPoints{ 0 };
+
     std::atomic<bool> isLogging{ false };
-    juce::int64 loggingStartTime = 0;
-    juce::CriticalSection dataLogLock;
+    std::atomic<juce::int64> loggingStartSample{ 0 };
+
+    // Timestamps come from the sample count, not the wall clock
+    juce::int64 samplesProcessed = 0; // audio thread only
+    std::atomic<juce::int64> samplesProcessedPublished{ 0 }; // updated once per block
+
+    void timerCallback() override { drainLogFifo(); }
+    void drainLogFifo();
 
     // Analysis functions
     void performFFTAnalysis();

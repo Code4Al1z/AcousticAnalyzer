@@ -55,6 +55,7 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
     for (int i = 0; i < buffer.getNumSamples(); ++i)
     {
         const float sample = channelData[i];
+        ++samplesProcessed;
 
         // Fixed-window RMS
         rmsSumOfSquares += static_cast<double>(sample) * sample;
@@ -76,6 +77,8 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
             performFFTAnalysis();
         }
     }
+
+    samplesProcessedPublished.store(samplesProcessed);
 }
 
 void AudioPluginAudioProcessor::performFFTAnalysis()
@@ -218,25 +221,38 @@ void AudioPluginAudioProcessor::calculateAcousticActivationScore()
 
 void AudioPluginAudioProcessor::startLogging()
 {
-    juce::ScopedLock lock(dataLogLock);
+    // Message thread. Throw away anything left over from a previous recording
+    isLogging.store(false);
+    drainLogFifo();
     dataLog.clear();
-    loggingStartTime = juce::Time::currentTimeMillis();
+    droppedLogPoints.store(0);
+
+    loggingStartSample.store(samplesProcessedPublished.load());
     isLogging.store(true);
+    startTimerHz(10);
 }
 
 void AudioPluginAudioProcessor::stopLogging()
 {
     isLogging.store(false);
+    stopTimer();
+    drainLogFifo();
 }
 
 void AudioPluginAudioProcessor::logDataPoint()
 {
-    juce::ScopedLock lock(dataLogLock);
+    // Audio thread: no locks, no allocation
+    int start1, size1, start2, size2;
+    logFifo.prepareToWrite(1, start1, size1, start2, size2);
 
-    double currentTime = (juce::Time::currentTimeMillis() - loggingStartTime) / 1000.0;
+    if (size1 == 0)
+    {
+        droppedLogPoints.fetch_add(1);
+        return;
+    }
 
-    DataPoint point;
-    point.timestamp = currentTime;
+    DataPoint& point = logFifoStorage[static_cast<size_t>(start1)];
+    point.timestamp = static_cast<double>(samplesProcessed - loggingStartSample.load()) / currentSampleRate;
     point.activationScore = acousticActivationScore.load();
     point.spectralCentroid = spectralCentroid.load();
     point.spectralHarshness = spectralHarshness.load();
@@ -244,7 +260,21 @@ void AudioPluginAudioProcessor::logDataPoint()
     point.temporalUnpredictability = temporalUnpredictability.load();
     point.rmsLevel = rmsLevel.load();
 
-    dataLog.push_back(point);
+    logFifo.finishedWrite(1);
+}
+
+void AudioPluginAudioProcessor::drainLogFifo()
+{
+    // Message thread only
+    int start1, size1, start2, size2;
+    logFifo.prepareToRead(logFifo.getNumReady(), start1, size1, start2, size2);
+
+    for (int i = 0; i < size1; ++i)
+        dataLog.push_back(logFifoStorage[static_cast<size_t>(start1 + i)]);
+    for (int i = 0; i < size2; ++i)
+        dataLog.push_back(logFifoStorage[static_cast<size_t>(start2 + i)]);
+
+    logFifo.finishedRead(size1 + size2);
 }
 
 double AudioPluginAudioProcessor::getRecordingTime() const
@@ -252,12 +282,12 @@ double AudioPluginAudioProcessor::getRecordingTime() const
     if (!isLogging.load())
         return 0.0;
 
-    return (juce::Time::currentTimeMillis() - loggingStartTime) / 1000.0;
+    return static_cast<double>(samplesProcessedPublished.load() - loggingStartSample.load()) / currentSampleRate;
 }
 
 void AudioPluginAudioProcessor::exportToCSV()
 {
-    juce::ScopedLock lock(dataLogLock);
+    drainLogFifo(); // Pick up anything the audio thread logged since the last drain
 
     if (dataLog.empty())
     {
@@ -283,6 +313,7 @@ void AudioPluginAudioProcessor::exportToCSV()
     }
 
     int totalPoints = static_cast<int>(dataLog.size());
+    int droppedPoints = droppedLogPoints.load();
 
     // Create file chooser on the heap (it will manage its own lifetime)
     auto chooser = std::make_shared<juce::FileChooser>(
@@ -294,7 +325,7 @@ void AudioPluginAudioProcessor::exportToCSV()
         | juce::FileBrowserComponent::canSelectFiles
         | juce::FileBrowserComponent::warnAboutOverwriting;
 
-    chooser->launchAsync(flags, [csvContent, totalPoints, chooser](const juce::FileChooser& fc)
+    chooser->launchAsync(flags, [csvContent, totalPoints, droppedPoints, chooser](const juce::FileChooser& fc)
         {
             auto result = fc.getURLResult();
             auto outputFile = result.getLocalFile();
@@ -307,7 +338,8 @@ void AudioPluginAudioProcessor::exportToCSV()
                     juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
                         "Export Successful",
                         "Data exported to:\n" + outputFile.getFullPathName() +
-                        "\n\nTotal data points: " + juce::String(totalPoints),
+                        "\n\nTotal data points: " + juce::String(totalPoints) +
+                        (droppedPoints > 0 ? "\nDropped (buffer overflow): " + juce::String(droppedPoints) : juce::String()),
                         "OK");
                 }
                 else
