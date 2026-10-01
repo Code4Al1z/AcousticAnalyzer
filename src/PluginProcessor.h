@@ -76,10 +76,16 @@ private:
     std::atomic<float> temporalUnpredictability{ 0.0f };
     std::atomic<float> acousticActivationScore{ 50.0f }; // 0-100 scale
 
-    // RMS history for dynamic analysis
+    // RMS history for dynamic analysis. One entry is added per fixed time
+    // window (not per audio block), so results don't depend on the host's
+    // buffer size. 100 entries x 20 ms = 2 seconds of history.
+    static constexpr double rmsWindowSeconds = 0.02;
     static constexpr int rmsHistorySize = 100;
     std::array<float, rmsHistorySize> rmsHistory{};
     int rmsHistoryPos = 0;
+    int rmsWindowSamples = 882;   // Set in prepareToPlay from the sample rate
+    int rmsSampleCount = 0;       // Samples accumulated in the current window
+    double rmsSumOfSquares = 0.0; // Running sum of squares for the current window
 
     double currentSampleRate = 44100.0;
 

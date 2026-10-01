@@ -20,6 +20,11 @@ AudioPluginAudioProcessor::~AudioPluginAudioProcessor() {}
 void AudioPluginAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
+    rmsWindowSamples = juce::jmax(1, juce::roundToInt(sampleRate * rmsWindowSeconds));
+    rmsSampleCount = 0;
+    rmsSumOfSquares = 0.0;
+    rmsHistory.fill(0.0f);
+    rmsHistoryPos = 0;
     fftPos = 0;
     fftInput.fill(0.0f);
     fftScratch.fill(0.0f);
@@ -43,22 +48,29 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear(i, 0, buffer.getNumSamples());
 
-    // Calculate RMS
-    float rms = buffer.getRMSLevel(0, 0, buffer.getNumSamples());
-    rmsLevel.store(rms);
-
-    // Store RMS in history
-    rmsHistory[rmsHistoryPos] = rms;
-    rmsHistoryPos = (rmsHistoryPos + 1) % rmsHistorySize;
-
-    // Collect samples for FFT (using first channel)
+    // Analysis uses the first channel. Samples feed two things:
+    //  - the RMS history, one entry per fixed time window (independent of block size)
+    //  - the FFT input buffer, one spectrum per fftSize samples
     auto* channelData = buffer.getReadPointer(0);
     for (int i = 0; i < buffer.getNumSamples(); ++i)
     {
-        fftInput[fftPos] = channelData[i];
-        fftPos++;
+        const float sample = channelData[i];
 
-        if (fftPos >= fftSize)
+        // Fixed-window RMS
+        rmsSumOfSquares += static_cast<double>(sample) * sample;
+        if (++rmsSampleCount >= rmsWindowSamples)
+        {
+            const float rms = static_cast<float>(std::sqrt(rmsSumOfSquares / rmsSampleCount));
+            rmsLevel.store(rms);
+            rmsHistory[rmsHistoryPos] = rms;
+            rmsHistoryPos = (rmsHistoryPos + 1) % rmsHistorySize;
+            rmsSumOfSquares = 0.0;
+            rmsSampleCount = 0;
+        }
+
+        // FFT frame collection
+        fftInput[fftPos] = sample;
+        if (++fftPos >= fftSize)
         {
             fftPos = 0;
             performFFTAnalysis();
@@ -168,9 +180,14 @@ void AudioPluginAudioProcessor::calculateTemporalUnpredictability()
     float totalDiff = 0.0f;
     int count = 0;
 
+    // Walk the ring buffer oldest -> newest so the jump from the newest entry
+    // back to the oldest one is not counted as a change
+    float previous = rmsHistory[rmsHistoryPos];
     for (int i = 1; i < rmsHistorySize; ++i)
     {
-        totalDiff += std::abs(rmsHistory[i] - rmsHistory[i - 1]);
+        const float current = rmsHistory[(rmsHistoryPos + i) % rmsHistorySize];
+        totalDiff += std::abs(current - previous);
+        previous = current;
         count++;
     }
 
