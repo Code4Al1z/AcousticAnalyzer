@@ -9,7 +9,9 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
     fft(fftOrder),
     window(fftSize, juce::dsp::WindowingFunction<float>::hann)
 {
-    fftData.fill(0.0f);
+    fftInput.fill(0.0f);
+    fftScratch.fill(0.0f);
+    magnitudes.fill(0.0f);
     rmsHistory.fill(0.0f);
 }
 
@@ -19,6 +21,9 @@ void AudioPluginAudioProcessor::prepareToPlay(double sampleRate, int samplesPerB
 {
     currentSampleRate = sampleRate;
     fftPos = 0;
+    fftInput.fill(0.0f);
+    fftScratch.fill(0.0f);
+    magnitudes.fill(0.0f);
 }
 
 void AudioPluginAudioProcessor::releaseResources() {}
@@ -50,7 +55,7 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
     auto* channelData = buffer.getReadPointer(0);
     for (int i = 0; i < buffer.getNumSamples(); ++i)
     {
-        fftData[fftPos] = channelData[i];
+        fftInput[fftPos] = channelData[i];
         fftPos++;
 
         if (fftPos >= fftSize)
@@ -63,11 +68,19 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
 
 void AudioPluginAudioProcessor::performFFTAnalysis()
 {
+    // Copy the collected frame into the scratch buffer and clear the upper
+    // half, which JUCE uses as working space for the transform
+    std::copy(fftInput.begin(), fftInput.end(), fftScratch.begin());
+    std::fill(fftScratch.begin() + fftSize, fftScratch.end(), 0.0f);
+
     // Apply windowing
-    window.multiplyWithWindowingTable(fftData.data(), fftSize);
+    window.multiplyWithWindowingTable(fftScratch.data(), fftSize);
 
     // Perform FFT
-    fft.performFrequencyOnlyForwardTransform(fftData.data());
+    fft.performFrequencyOnlyForwardTransform(fftScratch.data());
+
+    // Keep only the magnitude bins the analysis functions use
+    std::copy(fftScratch.begin(), fftScratch.begin() + numBins, magnitudes.begin());
 
     // Calculate metrics
     calculateSpectralCentroid();
@@ -88,9 +101,9 @@ void AudioPluginAudioProcessor::calculateSpectralCentroid()
     float numerator = 0.0f;
     float denominator = 0.0f;
 
-    for (int i = 0; i < fftSize / 2; ++i)
+    for (int i = 0; i < numBins; ++i)
     {
-        float magnitude = fftData[i];
+        float magnitude = magnitudes[i];
         float frequency = (i * currentSampleRate) / fftSize;
 
         numerator += magnitude * frequency;
@@ -110,11 +123,11 @@ void AudioPluginAudioProcessor::calculateSpectralHarshness()
 
     float lowFreqEnergy = 0.0f;
     float highFreqEnergy = 0.0f;
-    int crossoverBin = static_cast<int>((2000.0 * fftSize) / currentSampleRate);
+    int crossoverBin = juce::jlimit(0, numBins, static_cast<int>((2000.0 * fftSize) / currentSampleRate));
 
-    for (int i = 0; i < fftSize / 2; ++i)
+    for (int i = 0; i < numBins; ++i)
     {
-        float magnitude = fftData[i];
+        float magnitude = magnitudes[i];
         if (i < crossoverBin)
             lowFreqEnergy += magnitude;
         else

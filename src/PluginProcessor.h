@@ -2,6 +2,8 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
+#include <array>
+#include <atomic>
 #include <vector>
 
 //==============================================================================
@@ -57,7 +59,13 @@ private:
     juce::dsp::FFT fft;
     juce::dsp::WindowingFunction<float> window;
 
-    std::array<float, fftSize * 2> fftData;
+    static constexpr int numBins = fftSize / 2;
+
+    // Input is collected in its own buffer; the transform runs on a separate
+    // scratch buffer so incoming samples are never mixed with spectrum data.
+    std::array<float, fftSize> fftInput{};
+    std::array<float, fftSize * 2> fftScratch{}; // JUCE needs 2 * fftSize floats
+    std::array<float, numBins> magnitudes{};      // Result of the last analysis frame
     int fftPos = 0;
 
     // Analysis parameters (atomic for thread safety)
