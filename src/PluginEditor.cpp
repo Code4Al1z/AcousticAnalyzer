@@ -5,199 +5,219 @@
 AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor(AudioPluginAudioProcessor& p)
     : AudioProcessorEditor(&p), processor(p)
 {
-    setSize(600, 520);
+    setLookAndFeel(&lookAndFeel);
 
-    // Start Recording Button
-    startRecordingButton.setButtonText("Start Recording");
-    startRecordingButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff4CAF50));
-    startRecordingButton.onClick = [this]()
-        {
-            processor.startLogging();
-            startRecordingButton.setEnabled(false);
-            stopRecordingButton.setEnabled(true);
-            exportButton.setEnabled(false);
-        };
-    addAndMakeVisible(startRecordingButton);
+    // Metric tooltips: what each number means
+    brightnessBar.setTooltip("Sharpness (Zwicker / von Bismarck): how much of the loudness sits at high frequencies. "
+                             "0 to 4 acum maps to 0 to 100%.");
+    harshnessBar.setTooltip("Half roughness (fast amplitude modulation around 70 Hz, in asper), half the loudness "
+                            "in the 2 to 5 kHz region where hearing is most sensitive.");
+    dynamicsBar.setTooltip("Spread of the level (in dB) over the last 5 seconds. 12 dB or more reads 100%.");
+    unpredictabilityBar.setTooltip("Average level change between 50 ms windows over the last 5 seconds. "
+                                   "6 dB or more reads 100%.");
+    loudnessStat.setTooltip("Zwicker loudness in sone. Assumes 100 dB SPL at 0 dBFS RMS, so treat it as relative "
+                            "unless your monitoring is calibrated to that.");
+    levelStat.setTooltip("RMS level of the input, averaged over the analysed channels.");
 
-    // Stop Recording Button
-    stopRecordingButton.setButtonText("Stop Recording");
-    stopRecordingButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xffF44336));
-    stopRecordingButton.onClick = [this]()
-        {
-            processor.stopLogging();
-            startRecordingButton.setEnabled(true);
-            stopRecordingButton.setEnabled(false);
-            exportButton.setEnabled(true);
-        };
-    stopRecordingButton.setEnabled(false);
-    addAndMakeVisible(stopRecordingButton);
+    spectrum.setBandLayout(AudioPluginAudioProcessor::barkEdgesHz, AudioPluginAudioProcessor::barkCentresHz);
+    spectrum.setPresenceBands(AudioPluginAudioProcessor::presenceFirstBand, AudioPluginAudioProcessor::presenceLastBand);
 
-    // Export Button
-    exportButton.setButtonText("Export CSV");
-    exportButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff2196F3));
-    exportButton.onClick = [this]()
+    recordButton.setTooltip("Start or stop logging the analysis (about 40 points per second) for CSV export.");
+    recordButton.onClick = [this]()
         {
-            processor.exportToCSV();
+            if (processor.isCurrentlyLogging())
+                processor.stopLogging();
+            else
+                processor.startLogging();
+
+            updateRecordingControls();
         };
+
     exportButton.setEnabled(false);
-    addAndMakeVisible(exportButton);
+    exportButton.onClick = [this]() { processor.exportToCSV(); };
 
-    startTimerHz(30); // Update UI at 30 Hz
+    statusLabel.setFont(ui::font(13.0f));
+    statusLabel.setColour(juce::Label::textColourId, ui::palette::textSecondary);
+    statusLabel.setJustificationType(juce::Justification::centredLeft);
+
+    for (juce::Component* c : std::initializer_list<juce::Component*>{ &gauge, &brightnessBar, &harshnessBar, &dynamicsBar,
+             &unpredictabilityBar, &loudnessStat, &levelStat, &history, &spectrum, &recordButton, &exportButton, &statusLabel })
+        addAndMakeVisible(c);
+
+    setResizable(true, true);
+    setResizeLimits(820, 700, 1800, 1300);
+    setSize(940, 760);
+
+    updateRecordingControls();
+    startTimerHz(30);
 }
 
 AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
 {
+    setLookAndFeel(nullptr);
 }
 
 //==============================================================================
 void AudioPluginAudioProcessorEditor::paint(juce::Graphics& g)
 {
-    g.fillAll(juce::Colour(0xff1a1a1a));
+    g.fillAll(ui::palette::window);
 
-    // Title
-    g.setColour(juce::Colours::white);
-    g.setFont(22.0f);
-    g.drawText("Acoustic Environment Research Tool", 20, 15, getWidth() - 40, 25, juce::Justification::centred);
+    // Header
+    g.setColour(ui::palette::textPrimary);
+    g.setFont(ui::font(20.0f, true));
+    g.drawText("Acoustic Environment Research Tool", headerArea, juce::Justification::centredLeft);
 
-    // Version and beta label
-    g.setFont(12.0f);
-    g.setColour(juce::Colours::orange);
-    g.drawText("BETA v0.1", 20, 40, getWidth() - 40, 15, juce::Justification::centred);
+    const auto betaFont = ui::font(11.0f, true);
+    const auto betaWidth = static_cast<float>(ui::textWidth(betaFont, "BETA v0.1")) + 18.0f;
+    const auto beta = juce::Rectangle<float>(betaWidth, 22.0f)
+                          .withRightX(static_cast<float>(headerArea.getRight()))
+                          .withCentre({ static_cast<float>(headerArea.getRight()) - betaWidth * 0.5f, static_cast<float>(headerArea.getCentreY()) });
+    g.setColour(ui::palette::outline);
+    g.drawRoundedRectangle(beta.reduced(0.5f), 11.0f, 1.0f);
+    g.setColour(ui::palette::textSecondary);
+    g.setFont(betaFont);
+    g.drawText("BETA v0.1", beta, juce::Justification::centred);
 
-    // Recording status and time
-    if (processor.isCurrentlyLogging())
+    // Panels and their titles
+    struct Titled { juce::Rectangle<int> area; const char* title; };
+    for (const auto& panel : { Titled{ gaugePanel, nullptr },
+                               Titled{ metricsPanel, "PERCEPTUAL METRICS" },
+                               Titled{ historyPanel, "HISTORY - LAST 60 SECONDS" },
+                               Titled{ spectrumPanel, "LOUDNESS PER CRITICAL BAND (BARK SCALE)" } })
     {
-        g.setFont(14.0f);
-        g.setColour(juce::Colour(0xffFF5252));
-        juce::String statusText = "RECORDING - " + formatTime(processor.getRecordingTime());
-        g.drawText(statusText, 20, 430, 200, 20, juce::Justification::left);
+        ui::drawPanel(g, panel.area);
 
-        // Data point counter
-        g.setColour(juce::Colours::lightgrey);
-        g.setFont(12.0f);
-        juce::String pointsText = "Data points: " + juce::String(processor.getDataPointCount());
-        g.drawText(pointsText, 20, 450, 200, 20, juce::Justification::left);
-    }
-    else if (processor.getDataPointCount() > 0)
-    {
-        g.setFont(12.0f);
-        g.setColour(juce::Colour(0xff4CAF50));
-        juce::String statusText = "Ready to export (" + juce::String(processor.getDataPointCount()) + " points)";
-        g.drawText(statusText, 20, 440, 200, 20, juce::Justification::left);
+        if (panel.title != nullptr)
+        {
+            g.setColour(ui::palette::textMuted);
+            g.setFont(ui::font(11.0f, true));
+            g.drawText(panel.title, panel.area.getX() + 16, panel.area.getY() + 10, panel.area.getWidth() - 32, 16,
+                       juce::Justification::centredLeft);
+        }
     }
 
-    // Acoustic Activation Score (main display)
-    float score = processor.getAcousticActivationScore();
-    juce::Colour scoreColour = getScoreColour(score);
+    g.setColour(ui::palette::grid);
+    g.fillRect(juce::Rectangle<float>(static_cast<float>(loudnessStat.getX()) - 10.0f, static_cast<float>(metricsPanel.getY() + 40),
+                                      1.0f, static_cast<float>(metricsPanel.getHeight() - 52)));
 
-    g.setColour(scoreColour);
-    g.setFont(48.0f);
-    juce::String scoreText = juce::String(score, 1);
-    g.drawText(scoreText, 20, 70, getWidth() - 40, 60, juce::Justification::centred);
-
-    g.setFont(16.0f);
-    g.setColour(juce::Colours::lightgrey);
-    g.drawText("Acoustic Activation Index (0-100)", 20, 130, getWidth() - 40, 20, juce::Justification::centred);
-
-    // Interpretation text
-    g.setFont(14.0f);
-    g.setColour(scoreColour);
-    g.drawText(getInterpretationText(score), 20, 150, getWidth() - 40, 20, juce::Justification::centred);
-
-    // Individual metrics
-    int yPos = 190;
-    int barHeight = 30;
-    int spacing = 50;
-
-    drawMetricBar(g, "Spectral Brightness", processor.getSpectralCentroid(), yPos);
-    yPos += spacing;
-
-    drawMetricBar(g, "Spectral Harshness", processor.getSpectralHarshness(), yPos);
-    yPos += spacing;
-
-    drawMetricBar(g, "Dynamic Variability", processor.getDynamicVariability(), yPos);
-    yPos += spacing;
-
-    drawMetricBar(g, "Temporal Unpredictability", processor.getTemporalUnpredictability(), yPos);
-
-    // Disclaimer at bottom
-    g.setFont(10.0f);
-    g.setColour(juce::Colour(0xff888888));
-    g.drawText("Research tool in development - Measures acoustic activation potential",
-        20, getHeight() - 25, getWidth() - 40, 20, juce::Justification::centred);
+    g.setColour(ui::palette::textMuted);
+    g.setFont(ui::font(11.0f));
+    g.drawText("Research tool in development - measures acoustic activation potential", disclaimerArea,
+               juce::Justification::centred);
 }
 
 void AudioPluginAudioProcessorEditor::resized()
 {
-    // Position buttons at the bottom
-    int buttonWidth = 180;
-    int buttonHeight = 30;
-    int buttonY = 400;
-    int spacing = 10;
+    auto area = getLocalBounds().reduced(16);
+    const int gap = 12;
 
-    int totalWidth = (buttonWidth * 3) + (spacing * 2);
-    int startX = (getWidth() - totalWidth) / 2;
+    headerArea = area.removeFromTop(36);
+    area.removeFromTop(gap);
 
-    startRecordingButton.setBounds(startX, buttonY, buttonWidth, buttonHeight);
-    stopRecordingButton.setBounds(startX + buttonWidth + spacing, buttonY, buttonWidth, buttonHeight);
-    exportButton.setBounds(startX + (buttonWidth + spacing) * 2, buttonY, buttonWidth, buttonHeight);
+    disclaimerArea = area.removeFromBottom(16);
+    area.removeFromBottom(6);
+
+    auto footer = area.removeFromBottom(36);
+    area.removeFromBottom(gap);
+
+    // Top row: gauge and metrics
+    auto topRow = area.removeFromTop(juce::jlimit(176, 230, juce::roundToInt(static_cast<float>(area.getHeight()) * 0.27f)));
+    area.removeFromTop(gap);
+
+    gaugePanel = topRow.removeFromLeft(juce::jlimit(250, 340, juce::roundToInt(static_cast<float>(topRow.getWidth()) * 0.32f)));
+    topRow.removeFromLeft(gap);
+    metricsPanel = topRow;
+
+    // Below: history graph and band display
+    historyPanel = area.removeFromTop(juce::roundToInt(static_cast<float>(area.getHeight() - gap) * 0.55f));
+    area.removeFromTop(gap);
+    spectrumPanel = area;
+
+    // Children
+    gauge.setBounds(gaugePanel.reduced(10));
+
+    // Metrics: four bars on the left, the raw readouts stacked on the right
+    auto metrics = metricsPanel.reduced(16, 0).withTrimmedTop(34).withTrimmedBottom(10);
+    auto stats = metrics.removeFromRight(150);
+    metrics.removeFromRight(20);
+
+    const int barHeight = metrics.getHeight() / 4;
+    for (auto* bar : { &brightnessBar, &harshnessBar, &dynamicsBar, &unpredictabilityBar })
+        bar->setBounds(metrics.removeFromTop(barHeight).reduced(0, 3));
+
+    loudnessStat.setBounds(stats.removeFromTop(stats.getHeight() / 2));
+    levelStat.setBounds(stats);
+
+    history.setBounds(historyPanel.withTrimmedTop(30).reduced(10, 6));
+    spectrum.setBounds(spectrumPanel.withTrimmedTop(30).reduced(10, 6));
+
+    recordButton.setBounds(footer.removeFromLeft(130));
+    footer.removeFromLeft(gap);
+    exportButton.setBounds(footer.removeFromLeft(130));
+    footer.removeFromLeft(16);
+    statusLabel.setBounds(footer);
 }
 
 //==============================================================================
 void AudioPluginAudioProcessorEditor::timerCallback()
 {
-    repaint();
+    const float score = processor.getAcousticActivationScore();
+    const float brightness = processor.getSpectralCentroid();
+    const float harshness = processor.getSpectralHarshness();
+    const float dynamics = processor.getDynamicVariability();
+    const float unpredictability = processor.getTemporalUnpredictability();
+
+    gauge.setScore(score);
+    brightnessBar.setValue(brightness, juce::String(processor.getSharpnessAcum(), 2) + " acum");
+    harshnessBar.setValue(harshness, juce::String(processor.getRoughnessAsper(), 2) + " asper");
+    dynamicsBar.setValue(dynamics, {});
+    unpredictabilityBar.setValue(unpredictability, {});
+
+    loudnessStat.setValue(juce::String(processor.getLoudnessSones(), 1));
+
+    const float rmsDb = juce::Decibels::gainToDecibels(processor.getRMSLevel(), -100.0f);
+    levelStat.setValue(rmsDb <= -99.9f ? juce::String("-inf") : juce::String(rmsDb, 1));
+
+    std::array<float, ui::BarkSpectrumView::numBands> bands{};
+    processor.getSpecificLoudness(bands);
+    spectrum.update(bands);
+
+    // The graph keeps 10 samples per second
+    if (++timerTicks % 3 == 0)
+        history.push({ score, brightness * 100.0f, harshness * 100.0f, dynamics * 100.0f, unpredictability * 100.0f },
+                     processor.isCurrentlyLogging());
+
+    updateRecordingControls();
 }
 
-juce::Colour AudioPluginAudioProcessorEditor::getScoreColour(float score)
+void AudioPluginAudioProcessorEditor::updateRecordingControls()
 {
-    if (score > 70.0f) return juce::Colour(0xff4CAF50); // Green
-    if (score > 40.0f) return juce::Colour(0xffFFC107); // Amber
-    return juce::Colour(0xffF44336); // Red
-}
+    const bool logging = processor.isCurrentlyLogging();
+    const int points = processor.getDataPointCount();
 
-juce::String AudioPluginAudioProcessorEditor::getInterpretationText(float score)
-{
-    if (score > 70.0f)
-        return "Low Activation - Calming";
-    else if (score > 40.0f)
-        return "Medium Activation - Neutral";
+    recordButton.setToggleState(logging, juce::dontSendNotification);
+    exportButton.setEnabled(!logging && points > 0);
+
+    juce::String status;
+    if (logging)
+        status = "Recording  " + formatTime(processor.getRecordingTime()) + "   -   " + juce::String(points) + " points";
+    else if (points > 0)
+        status = "Ready to export  -  " + juce::String(points) + " points";
     else
-        return "High Activation - Stimulating";
+        status = "Not recording";
+
+    if (processor.getDroppedPointCount() > 0)
+        status += "   -   " + juce::String(processor.getDroppedPointCount()) + " dropped";
+
+    statusLabel.setText(status, juce::dontSendNotification);
+    statusLabel.setColour(juce::Label::textColourId, logging ? ui::palette::textPrimary : ui::palette::textSecondary);
 }
 
 juce::String AudioPluginAudioProcessorEditor::formatTime(double seconds)
 {
-    int mins = static_cast<int>(seconds) / 60;
-    int secs = static_cast<int>(seconds) % 60;
-    int millis = static_cast<int>((seconds - static_cast<int>(seconds)) * 10);
+    const int mins = static_cast<int>(seconds) / 60;
+    const int secs = static_cast<int>(seconds) % 60;
+    const int tenths = static_cast<int>((seconds - static_cast<int>(seconds)) * 10);
 
-    return juce::String::formatted("%02d:%02d.%01d", mins, secs, millis);
-}
-
-void AudioPluginAudioProcessorEditor::drawMetricBar(juce::Graphics& g, const juce::String& label, float value, int y)
-{
-    int barX = 190;
-    int barWidth = getWidth() - barX - 50;
-    int barHeight = 20;
-
-    // Label
-    g.setColour(juce::Colours::white);
-    g.setFont(14.0f);
-    g.drawText(label, 20, y, 160, barHeight, juce::Justification::left);
-
-    // Background bar
-    g.setColour(juce::Colour(0xff333333));
-    g.fillRect(barX, y, barWidth, barHeight);
-
-    // Value bar
-    juce::Colour barColour = juce::Colour(0xff2196F3);
-    g.setColour(barColour);
-    g.fillRect(barX, y, static_cast<int>(barWidth * value), barHeight);
-
-    // Value text
-    g.setColour(juce::Colours::white);
-    g.setFont(12.0f);
-    juce::String valueText = juce::String(value * 100.0f, 0) + "%";
-    g.drawText(valueText, barX + barWidth + 10, y, 50, barHeight, juce::Justification::left);
+    return juce::String::formatted("%02d:%02d.%01d", mins, secs, tenths);
 }

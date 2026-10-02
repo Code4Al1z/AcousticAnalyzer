@@ -14,6 +14,9 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
     fftScratch.fill(0.0f);
     powerSpectrum.fill(0.0f);
     rmsHistoryDb.fill(rmsFloorDb);
+
+    for (auto& band : sharedSpecificLoudness)
+        band.store(0.0f);
 }
 
 AudioPluginAudioProcessor::~AudioPluginAudioProcessor() {}
@@ -187,6 +190,9 @@ void AudioPluginAudioProcessor::performFFTAnalysis()
     // Digital silence: hold the last values rather than reporting "calm"
     if (sumOfSquares / (static_cast<double>(fftSize) * analysisChannels) < silenceMeanSquare)
     {
+        for (auto& band : sharedSpecificLoudness) // The band display should show the silence
+            band.store(0.0f, std::memory_order_relaxed);
+
         if (isLogging.load())
             logDataPoint();
         return;
@@ -222,6 +228,9 @@ void AudioPluginAudioProcessor::performFFTAnalysis()
     float loudness = 0.0f, sharpness = 0.0f, presenceLoudness = 0.0f;
     computeBarkAnalysis(loudness, sharpness, presenceLoudness);
     const float roughness = computeRoughness();
+
+    for (size_t b = 0; b < sharedSpecificLoudness.size(); ++b)
+        sharedSpecificLoudness[b].store(specificLoudness[b], std::memory_order_relaxed);
 
     const float smoothedLoudness = loudnessSmoother.process(loudness,
         smoothingAttackCoeff, smoothingReleaseCoeff);

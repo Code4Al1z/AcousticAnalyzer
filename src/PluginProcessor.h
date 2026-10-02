@@ -51,6 +51,28 @@ public:
     float getSharpnessAcum() const { return sharpnessAcum.load(); }
     float getRoughnessAsper() const { return roughnessAsper.load(); }
 
+    // Critical band (Bark) layout used by the analysis, shared with the UI
+    static constexpr int numBarkBands = 24;
+    static constexpr std::array<float, numBarkBands + 1> barkEdgesHz{
+        0.0f, 100.0f, 200.0f, 300.0f, 400.0f, 510.0f, 630.0f, 770.0f, 920.0f, 1080.0f,
+        1270.0f, 1480.0f, 1720.0f, 2000.0f, 2320.0f, 2700.0f, 3150.0f, 3700.0f, 4400.0f,
+        5300.0f, 6400.0f, 7700.0f, 9500.0f, 12000.0f, 15500.0f };
+    static constexpr std::array<float, numBarkBands> barkCentresHz{
+        50.0f, 150.0f, 250.0f, 350.0f, 450.0f, 570.0f, 700.0f, 840.0f, 1000.0f, 1170.0f,
+        1370.0f, 1600.0f, 1850.0f, 2150.0f, 2500.0f, 2900.0f, 3400.0f, 4000.0f, 4800.0f,
+        5800.0f, 7000.0f, 8500.0f, 10500.0f, 13500.0f };
+
+    // "Presence" region: Bark bands 13-18 = 2.0 kHz to 5.3 kHz, where hearing is most sensitive
+    static constexpr int presenceFirstBand = 13;
+    static constexpr int presenceLastBand = 18;
+
+    // Last frame's specific loudness per Bark band (sone/Bark), for display
+    void getSpecificLoudness(std::array<float, numBarkBands>& destination) const
+    {
+        for (size_t i = 0; i < destination.size(); ++i)
+            destination[i] = sharedSpecificLoudness[i].load(std::memory_order_relaxed);
+    }
+
     // Data logging functions
     void startLogging();
     void stopLogging();
@@ -97,20 +119,6 @@ private:
     // 0 dBFS RMS (a full-scale sine is 3 dB below that). Set it to match your
     // monitoring chain; the metrics are only as absolute as this number.
     static constexpr float referenceSplAtFullScaleRms = 100.0f;
-
-    static constexpr int numBarkBands = 24;
-    static constexpr std::array<float, numBarkBands + 1> barkEdgesHz{
-        0.0f, 100.0f, 200.0f, 300.0f, 400.0f, 510.0f, 630.0f, 770.0f, 920.0f, 1080.0f,
-        1270.0f, 1480.0f, 1720.0f, 2000.0f, 2320.0f, 2700.0f, 3150.0f, 3700.0f, 4400.0f,
-        5300.0f, 6400.0f, 7700.0f, 9500.0f, 12000.0f, 15500.0f };
-    static constexpr std::array<float, numBarkBands> barkCentresHz{
-        50.0f, 150.0f, 250.0f, 350.0f, 450.0f, 570.0f, 700.0f, 840.0f, 1000.0f, 1170.0f,
-        1370.0f, 1600.0f, 1850.0f, 2150.0f, 2500.0f, 2900.0f, 3400.0f, 4000.0f, 4800.0f,
-        5800.0f, 7000.0f, 8500.0f, 10500.0f, 13500.0f };
-
-    // "Presence" region: Bark bands 13-18 = 2.0 kHz to 5.3 kHz, where hearing is most sensitive
-    static constexpr int presenceFirstBand = 13;
-    static constexpr int presenceLastBand = 18;
 
     // Set in prepareToPlay for the current sample rate
     std::array<int, numBarkBands + 1> barkBinEdges{};              // First FFT bin of each band
@@ -257,6 +265,7 @@ private:
     std::atomic<float> dynamicVariability{ 0.0f };
     std::atomic<float> temporalUnpredictability{ 0.0f };
     std::atomic<float> acousticActivationScore{ 50.0f }; // 0-100 scale
+    std::array<std::atomic<float>, numBarkBands> sharedSpecificLoudness{}; // Written by the audio thread, read by the UI
     std::atomic<float> loudnessSones{ 0.0f };
     std::atomic<float> sharpnessAcum{ 0.0f };
     std::atomic<float> roughnessAsper{ 0.0f };
