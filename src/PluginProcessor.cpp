@@ -44,10 +44,58 @@ void AudioPluginAudioProcessor::prepareToPlay(double sampleRate, int /*samplesPe
     const double hopSeconds = hopSize / sampleRate;
     smoothingAttackCoeff = static_cast<float>(1.0 - std::exp(-hopSeconds / smoothingAttackSeconds));
     smoothingReleaseCoeff = static_cast<float>(1.0 - std::exp(-hopSeconds / smoothingReleaseSeconds));
-    centroidSmoother.reset();
-    harshnessSmoother.reset();
+    sharpnessSmoother.reset();
+    roughnessSmoother.reset();
+    presenceSmoother.reset();
+    loudnessSmoother.reset();
     dynamicSmoother.reset();
     temporalSmoother.reset();
+
+    // Bark bands: the first FFT bin of each band (DC is skipped)
+    for (int b = 0; b <= numBarkBands; ++b)
+        barkBinEdges[static_cast<size_t>(b)] = juce::jlimit(1, numBins,
+            static_cast<int>(std::ceil(barkEdgesHz[static_cast<size_t>(b)] * fftSize / sampleRate)));
+
+    // Threshold in quiet at each band centre (Terhardt), as intensity relative to 0 dB SPL
+    for (int b = 0; b < numBarkBands; ++b)
+    {
+        const double fkHz = barkCentresHz[static_cast<size_t>(b)] / 1000.0;
+        const double thresholdDb = 3.64 * std::pow(fkHz, -0.8)
+                                 - 6.5 * std::exp(-0.6 * (fkHz - 3.3) * (fkHz - 3.3))
+                                 + 1.0e-3 * std::pow(fkHz, 4.0);
+        thresholdIntensity[static_cast<size_t>(b)] = static_cast<float>(std::pow(10.0, thresholdDb / 10.0));
+    }
+
+    bandSplDb.fill(-100.0f);
+    specificLoudness.fill(0.0f);
+
+    // Roughness filterbank: skip bands too close to Nyquist
+    lastRoughnessBand = 0;
+    while (lastRoughnessBand < numBarkBands
+           && barkEdgesHz[static_cast<size_t>(lastRoughnessBand) + 1] <= 0.45 * sampleRate)
+        ++lastRoughnessBand;
+
+    roughnessMeanCoeff = 1.0 - std::exp(-1.0 / (sampleRate * roughnessMeanSeconds));
+    roughnessPowerCoeff = 1.0 - std::exp(-1.0 / (sampleRate * roughnessPowerSeconds));
+
+    for (auto& channelBands : roughnessBands)
+    {
+        for (int b = firstRoughnessBand; b < lastRoughnessBand; ++b)
+        {
+            const double low = barkEdgesHz[static_cast<size_t>(b)];
+            const double high = barkEdgesHz[static_cast<size_t>(b) + 1];
+            const double centre = std::sqrt(low * high);
+
+            auto& band = channelBands[static_cast<size_t>(b)];
+            band = RoughnessBand{};
+            band.bandpass.setBandpass(sampleRate, centre, centre / (high - low));
+            band.envLowpass.setLowpass(sampleRate, roughnessEnvelopeCutoffHz, 0.7071);
+            band.modBandpass.setBandpass(sampleRate, roughnessModulationHz, roughnessModulationQ);
+        }
+    }
+
+    for (auto& cross : modulationCross)
+        cross.fill(0.0);
 }
 
 void AudioPluginAudioProcessor::releaseResources() {}
@@ -91,6 +139,7 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
             const float sample = buffer.getReadPointer(ch)[i];
             fftInput[static_cast<size_t>(ch)][static_cast<size_t>(fftPos)] = sample;
             sumOfSquares += sample * sample;
+            processRoughnessSample(ch, sample);
         }
 
         ++samplesProcessed;
@@ -169,69 +218,204 @@ void AudioPluginAudioProcessor::performFFTAnalysis()
         }
     }
 
-    // Raw metrics, then smoothed so the meters are stable
-    const float centroid = centroidSmoother.process(computeSpectralCentroid(),
+    // Psychoacoustic analysis, then smoothed so the meters are stable
+    float loudness = 0.0f, sharpness = 0.0f, presenceLoudness = 0.0f;
+    computeBarkAnalysis(loudness, sharpness, presenceLoudness);
+    const float roughness = computeRoughness();
+
+    const float smoothedLoudness = loudnessSmoother.process(loudness,
         smoothingAttackCoeff, smoothingReleaseCoeff);
-    const float harshness = harshnessSmoother.process(computeSpectralHarshness(),
+    const float smoothedSharpness = sharpnessSmoother.process(sharpness,
+        smoothingAttackCoeff, smoothingReleaseCoeff);
+    const float smoothedRoughness = roughnessSmoother.process(roughness,
+        smoothingAttackCoeff, smoothingReleaseCoeff);
+    const float smoothedPresence = presenceSmoother.process(presenceLoudness,
         smoothingAttackCoeff, smoothingReleaseCoeff);
     const float dynamics = dynamicSmoother.process(computeDynamicVariability(),
         smoothingAttackCoeff, smoothingReleaseCoeff);
     const float unpredictability = temporalSmoother.process(computeTemporalUnpredictability(),
         smoothingAttackCoeff, smoothingReleaseCoeff);
 
-    spectralCentroid.store(centroid);
+    // Normalise to 0-1: brightness from sharpness, harshness from roughness + presence
+    const float brightness = juce::jlimit(0.0f, 1.0f, smoothedSharpness / sharpnessFullScaleAcum);
+    const float roughnessNorm = juce::jlimit(0.0f, 1.0f, smoothedRoughness / roughnessFullScaleAsper);
+    const float presenceNorm = juce::jlimit(0.0f, 1.0f, smoothedPresence / presenceFullScaleSone);
+    const float harshness = harshnessRoughnessWeight * roughnessNorm
+                          + (1.0f - harshnessRoughnessWeight) * presenceNorm;
+
+    loudnessSones.store(smoothedLoudness);
+    sharpnessAcum.store(smoothedSharpness);
+    roughnessAsper.store(smoothedRoughness);
+    spectralCentroid.store(brightness);
     spectralHarshness.store(harshness);
     dynamicVariability.store(dynamics);
     temporalUnpredictability.store(unpredictability);
     acousticActivationScore.store(
-        computeAcousticActivationScore(centroid, harshness, dynamics, unpredictability));
+        computeAcousticActivationScore(brightness, harshness, dynamics, unpredictability));
 
     // Log data if recording
     if (isLogging.load())
         logDataPoint();
 }
 
-float AudioPluginAudioProcessor::computeSpectralCentroid() const
+void AudioPluginAudioProcessor::computeBarkAnalysis(float& loudness, float& sharpness, float& presenceLoudness)
 {
-    // Power-weighted centroid (skipping the DC bin), mapped to 0-1 on a log
-    // frequency axis because pitch and brightness are perceived logarithmically
-    double weightedSum = 0.0;
-    double totalPower = 0.0;
+    // Power in the FFT bins -> mean square of the signal. For a Hann window this
+    // is 16 / (3 N^2) times the one-sided sum of bin powers (same for tones and noise).
+    constexpr double powerToMeanSquare = 16.0 / (3.0 * static_cast<double>(fftSize) * fftSize);
 
-    for (int i = 1; i < numBins; ++i)
+    std::array<double, numBarkBands> intensity{};
+
+    for (int b = 0; b < numBarkBands; ++b)
     {
-        const double power = powerSpectrum[static_cast<size_t>(i)];
-        weightedSum += power * (i * currentSampleRate / fftSize);
-        totalPower += power;
+        double power = 0.0;
+        for (int bin = barkBinEdges[static_cast<size_t>(b)]; bin < barkBinEdges[static_cast<size_t>(b) + 1]; ++bin)
+            power += powerSpectrum[static_cast<size_t>(bin)];
+
+        const double meanSquare = juce::jmax(power * powerToMeanSquare, 1.0e-20);
+        const double splDb = referenceSplAtFullScaleRms + 10.0 * std::log10(meanSquare);
+
+        bandSplDb[static_cast<size_t>(b)] = static_cast<float>(splDb);
+        intensity[static_cast<size_t>(b)] = std::pow(10.0, splDb / 10.0);
     }
 
-    if (totalPower <= 0.0)
-        return 0.0f;
+    // Excitation: each band's energy spreads to its neighbours with Zwicker's
+    // slopes. Below the band it falls 27 dB per Bark; above it the slope gets
+    // shallower with level (24 + 230/f - 0.2 L dB per Bark), which is why loud
+    // sounds mask upwards.
+    std::array<double, numBarkBands> excitation{};
+    const double lowerFactor = std::pow(10.0, -27.0 / 10.0);
 
-    const float centroidHz = juce::jlimit(centroidMinHz, centroidMaxHz,
-                                          static_cast<float>(weightedSum / totalPower));
+    for (int source = 0; source < numBarkBands; ++source)
+    {
+        const double sourceIntensity = intensity[static_cast<size_t>(source)];
+        const double slopeDbPerBark = juce::jmax(3.0,
+            24.0 + 230.0 / barkCentresHz[static_cast<size_t>(source)] - 0.2 * bandSplDb[static_cast<size_t>(source)]);
+        const double upperFactor = std::pow(10.0, -slopeDbPerBark / 10.0);
 
-    return std::log2(centroidHz / centroidMinHz) / std::log2(centroidMaxHz / centroidMinHz);
+        excitation[static_cast<size_t>(source)] += sourceIntensity;
+
+        double spread = sourceIntensity;
+        for (int i = source + 1; i < numBarkBands; ++i)
+            excitation[static_cast<size_t>(i)] += (spread *= upperFactor);
+
+        spread = sourceIntensity;
+        for (int i = source - 1; i >= 0; --i)
+            excitation[static_cast<size_t>(i)] += (spread *= lowerFactor);
+    }
+
+    // Specific loudness (Zwicker), sone per Bark; each band is about 1 Bark wide.
+    // The prefactor uses the threshold in quiet at 1 kHz (about 3.4 dB SPL) for every
+    // band; only the excitation-to-threshold ratio varies with frequency.
+    static const double referenceThresholdTerm = std::pow(std::pow(10.0, 0.3369), 0.23);
+
+    double totalLoudness = 0.0;
+    double sharpnessSum = 0.0;
+    double presenceSum = 0.0;
+
+    for (int i = 0; i < numBarkBands; ++i)
+    {
+        const double threshold = thresholdIntensity[static_cast<size_t>(i)];
+        const double specific = loudnessScale * juce::jmax(0.0,
+            0.08 * referenceThresholdTerm
+                 * (std::pow(0.5 + 0.5 * excitation[static_cast<size_t>(i)] / threshold, 0.23) - 1.0));
+
+        specificLoudness[static_cast<size_t>(i)] = static_cast<float>(specific);
+        totalLoudness += specific;
+
+        // Sharpness weighting grows above 15.8 Bark (von Bismarck / Zwicker)
+        const double z = i + 0.5;
+        const double weight = z <= 15.8 ? 1.0 : 0.15 * std::exp(0.42 * (z - 15.8)) + 0.85;
+        sharpnessSum += specific * weight * z;
+
+        if (i >= presenceFirstBand && i <= presenceLastBand)
+            presenceSum += specific;
+    }
+
+    loudness = static_cast<float>(totalLoudness);
+    sharpness = totalLoudness > 1.0e-6 ? static_cast<float>(0.11 * sharpnessSum / totalLoudness) : 0.0f;
+    presenceLoudness = static_cast<float>(presenceSum);
 }
 
-float AudioPluginAudioProcessor::computeSpectralHarshness() const
+void AudioPluginAudioProcessor::processRoughnessSample(int channel, float sample)
 {
-    // Fraction of spectral power above the crossover (0 = all low, 1 = all high)
-    const int crossoverBin = juce::jlimit(1, numBins,
-        juce::roundToInt(harshnessCrossoverHz * fftSize / currentSampleRate));
+    // Audio thread, per sample: split into Bark bands, extract each band's
+    // envelope, and track the envelope's modulation around 70 Hz
+    auto& bands = roughnessBands[static_cast<size_t>(channel)];
 
-    double lowPower = 0.0;
-    double highPower = 0.0;
-
-    for (int i = 1; i < numBins; ++i)
+    for (int b = firstRoughnessBand; b < lastRoughnessBand; ++b)
     {
-        const double power = powerSpectrum[static_cast<size_t>(i)];
-        (i < crossoverBin ? lowPower : highPower) += power;
+        auto& band = bands[static_cast<size_t>(b)];
+
+        const double filtered = band.bandpass.process(sample);
+        const double envelope = band.envLowpass.process(std::abs(filtered));
+
+        band.envMean += roughnessMeanCoeff * (envelope - band.envMean);
+        band.lastModulation = band.modBandpass.process(envelope);
+        band.modPower += roughnessPowerCoeff * (band.lastModulation * band.lastModulation - band.modPower);
     }
 
-    const double totalPower = lowPower + highPower;
+    // How in step neighbouring bands' modulations are (noise: not at all,
+    // an amplitude-modulated tone: fully)
+    auto& cross = modulationCross[static_cast<size_t>(channel)];
 
-    return totalPower > 0.0 ? juce::jlimit(0.0f, 1.0f, static_cast<float>(highPower / totalPower)) : 0.0f;
+    for (int b = firstRoughnessBand; b + 1 < lastRoughnessBand; ++b)
+        cross[static_cast<size_t>(b)] += roughnessPowerCoeff
+            * (bands[static_cast<size_t>(b)].lastModulation * bands[static_cast<size_t>(b) + 1].lastModulation
+               - cross[static_cast<size_t>(b)]);
+}
+
+float AudioPluginAudioProcessor::computeRoughness() const
+{
+    // Per band: modulation depth x neighbour correlation x audibility, summed.
+    // Simplified from Daniel & Weber; calibrated by roughnessScale so that a
+    // 1 kHz tone, 70 Hz AM at 100%, 60 dB SPL reads 1 asper.
+    double total = 0.0;
+
+    for (int ch = 0; ch < analysisChannels; ++ch)
+    {
+        const auto& bands = roughnessBands[static_cast<size_t>(ch)];
+        const auto& cross = modulationCross[static_cast<size_t>(ch)];
+
+        for (int b = firstRoughnessBand; b < lastRoughnessBand; ++b)
+        {
+            const auto& band = bands[static_cast<size_t>(b)];
+            if (band.envMean < 1.0e-9)
+                continue;
+
+            // Modulation depth (AC rms x sqrt 2 / DC, so 100% AM reads 1)
+            const double depth = juce::jmin(1.0, std::sqrt(2.0 * band.modPower) / band.envMean);
+
+            double correlationSum = 0.0;
+            int neighbours = 0;
+
+            if (b > firstRoughnessBand)
+            {
+                const double denominator = std::sqrt(bands[static_cast<size_t>(b) - 1].modPower * band.modPower) + 1.0e-18;
+                correlationSum += cross[static_cast<size_t>(b) - 1] / denominator;
+                ++neighbours;
+            }
+
+            if (b + 1 < lastRoughnessBand)
+            {
+                const double denominator = std::sqrt(band.modPower * bands[static_cast<size_t>(b) + 1].modPower) + 1.0e-18;
+                correlationSum += cross[static_cast<size_t>(b)] / denominator;
+                ++neighbours;
+            }
+
+            const double correlation = neighbours > 0 ? juce::jlimit(0.0, 1.0, correlationSum / neighbours) : 0.0;
+
+            // Bands near or below the threshold in quiet can't contribute
+            const double thresholdDb = 10.0 * std::log10(static_cast<double>(thresholdIntensity[static_cast<size_t>(b)]));
+            const double audibility = juce::jlimit(0.0, 1.0, (bandSplDb[static_cast<size_t>(b)] - thresholdDb) / 40.0);
+
+            total += audibility
+                   * std::pow(depth, static_cast<double>(roughnessDepthExponent))
+                   * std::pow(correlation, static_cast<double>(roughnessCorrelationExponent));
+        }
+    }
+
+    return static_cast<float>(roughnessScale * total / analysisChannels);
 }
 
 float AudioPluginAudioProcessor::computeDynamicVariability() const
@@ -341,6 +525,9 @@ void AudioPluginAudioProcessor::logDataPoint()
     point.dynamicVariability = dynamicVariability.load();
     point.temporalUnpredictability = temporalUnpredictability.load();
     point.rmsLevel = rmsLevel.load();
+    point.loudnessSones = loudnessSones.load();
+    point.sharpnessAcum = sharpnessAcum.load();
+    point.roughnessAsper = roughnessAsper.load();
 
     logFifo.finishedWrite(1);
 }
@@ -381,7 +568,7 @@ void AudioPluginAudioProcessor::exportToCSV()
     }
 
     // Create CSV content first (before the async callback)
-    juce::String csvContent = "Timestamp_Seconds,Activation_Score,Spectral_Centroid,Spectral_Harshness,Dynamic_Variability,Temporal_Unpredictability,RMS_Level\n";
+    juce::String csvContent = "Timestamp_Seconds,Activation_Score,Brightness,Harshness,Dynamic_Variability,Temporal_Unpredictability,RMS_Level,Loudness_Sone,Sharpness_Acum,Roughness_Asper\n";
 
     for (const auto& point : dataLog)
     {
@@ -391,7 +578,10 @@ void AudioPluginAudioProcessor::exportToCSV()
         csvContent += juce::String(point.spectralHarshness, 4) + ",";
         csvContent += juce::String(point.dynamicVariability, 4) + ",";
         csvContent += juce::String(point.temporalUnpredictability, 4) + ",";
-        csvContent += juce::String(point.rmsLevel, 6) + "\n";
+        csvContent += juce::String(point.rmsLevel, 6) + ",";
+        csvContent += juce::String(point.loudnessSones, 3) + ",";
+        csvContent += juce::String(point.sharpnessAcum, 3) + ",";
+        csvContent += juce::String(point.roughnessAsper, 3) + "\n";
     }
 
     int totalPoints = static_cast<int>(dataLog.size());

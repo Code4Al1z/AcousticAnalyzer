@@ -4,6 +4,7 @@
 #include <juce_dsp/juce_dsp.h>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <vector>
 
 //==============================================================================
@@ -45,6 +46,11 @@ public:
     float getTemporalUnpredictability() const { return temporalUnpredictability.load(); }
     float getAcousticActivationScore() const { return acousticActivationScore.load(); }
 
+    // Psychoacoustic quantities in their own units (the getters above are 0-1)
+    float getLoudnessSones() const { return loudnessSones.load(); }
+    float getSharpnessAcum() const { return sharpnessAcum.load(); }
+    float getRoughnessAsper() const { return roughnessAsper.load(); }
+
     // Data logging functions
     void startLogging();
     void stopLogging();
@@ -80,27 +86,130 @@ private:
     int fftSamplesCollected = 0; // Saturates at fftSize; no analysis until the buffer is full
     int samplesSinceFrame = 0;
 
+    // ---- Psychoacoustic model ----------------------------------------------
+    // The power spectrum is grouped into the 24 Bark critical bands, then:
+    //  - loudness (sone): Zwicker excitation slopes + specific loudness
+    //  - sharpness (acum): von Bismarck / Zwicker weighting of specific loudness
+    //  - roughness (asper): envelope modulation around 70 Hz per band, weighted by
+    //    how correlated neighbouring bands are (simplified Daniel & Weber model)
+    //
+    // Absolute units need a level calibration: SPL when the digital signal has
+    // 0 dBFS RMS (a full-scale sine is 3 dB below that). Set it to match your
+    // monitoring chain; the metrics are only as absolute as this number.
+    static constexpr float referenceSplAtFullScaleRms = 100.0f;
+
+    static constexpr int numBarkBands = 24;
+    static constexpr std::array<float, numBarkBands + 1> barkEdgesHz{
+        0.0f, 100.0f, 200.0f, 300.0f, 400.0f, 510.0f, 630.0f, 770.0f, 920.0f, 1080.0f,
+        1270.0f, 1480.0f, 1720.0f, 2000.0f, 2320.0f, 2700.0f, 3150.0f, 3700.0f, 4400.0f,
+        5300.0f, 6400.0f, 7700.0f, 9500.0f, 12000.0f, 15500.0f };
+    static constexpr std::array<float, numBarkBands> barkCentresHz{
+        50.0f, 150.0f, 250.0f, 350.0f, 450.0f, 570.0f, 700.0f, 840.0f, 1000.0f, 1170.0f,
+        1370.0f, 1600.0f, 1850.0f, 2150.0f, 2500.0f, 2900.0f, 3400.0f, 4000.0f, 4800.0f,
+        5800.0f, 7000.0f, 8500.0f, 10500.0f, 13500.0f };
+
+    // "Presence" region: Bark bands 13-18 = 2.0 kHz to 5.3 kHz, where hearing is most sensitive
+    static constexpr int presenceFirstBand = 13;
+    static constexpr int presenceLastBand = 18;
+
+    // Set in prepareToPlay for the current sample rate
+    std::array<int, numBarkBands + 1> barkBinEdges{};              // First FFT bin of each band
+    std::array<float, numBarkBands> thresholdIntensity{};          // Threshold in quiet, 10^(dB SPL / 10)
+    std::array<float, numBarkBands> bandSplDb{};                   // Last frame's level per band
+    std::array<float, numBarkBands> specificLoudness{};            // Last frame's sone per Bark
+
+    // Roughness filterbank (audio rate, double precision). Only bands from
+    // firstRoughnessBand up are used: below ~500 Hz the carrier is too close to
+    // the modulation range to separate the envelope.
+    struct Biquad
+    {
+        double b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
+
+        void reset() { z1 = z2 = 0.0; }
+
+        double process(double x)
+        {
+            const double y = b0 * x + z1;
+            z1 = b1 * x - a1 * y + z2;
+            z2 = b2 * x - a2 * y;
+            return y;
+        }
+
+        // RBJ cookbook, constant 0 dB peak gain bandpass
+        void setBandpass(double sampleRate, double frequency, double q)
+        {
+            const double w0 = 2.0 * juce::MathConstants<double>::pi * frequency / sampleRate;
+            const double alpha = std::sin(w0) / (2.0 * q);
+            const double a0 = 1.0 + alpha;
+            b0 = alpha / a0; b1 = 0.0; b2 = -alpha / a0;
+            a1 = -2.0 * std::cos(w0) / a0; a2 = (1.0 - alpha) / a0;
+        }
+
+        void setLowpass(double sampleRate, double frequency, double q)
+        {
+            const double w0 = 2.0 * juce::MathConstants<double>::pi * frequency / sampleRate;
+            const double alpha = std::sin(w0) / (2.0 * q);
+            const double a0 = 1.0 + alpha;
+            b0 = (1.0 - std::cos(w0)) * 0.5 / a0; b1 = (1.0 - std::cos(w0)) / a0; b2 = b0;
+            a1 = -2.0 * std::cos(w0) / a0; a2 = (1.0 - alpha) / a0;
+        }
+    };
+
+    struct RoughnessBand
+    {
+        Biquad bandpass;     // Isolates one Bark band
+        Biquad envLowpass;   // Smooths the rectified signal into an envelope
+        Biquad modBandpass;  // Modulation weighting, peak at roughnessModulationHz
+        double envMean = 0.0;   // Slow average of the envelope (the "DC" level)
+        double modPower = 0.0;  // Average power of the weighted modulation
+        double lastModulation = 0.0;
+    };
+
+    static constexpr int firstRoughnessBand = 5;
+    static constexpr double roughnessModulationHz = 70.0;
+    static constexpr double roughnessModulationQ = 0.7;
+    static constexpr double roughnessEnvelopeCutoffHz = 500.0;
+    static constexpr double roughnessMeanSeconds = 0.08;
+    static constexpr double roughnessPowerSeconds = 0.12;
+
+    std::array<std::array<RoughnessBand, numBarkBands>, maxAnalysisChannels> roughnessBands{};
+    std::array<std::array<double, numBarkBands>, maxAnalysisChannels> modulationCross{}; // band b x band b+1
+    int lastRoughnessBand = numBarkBands; // Exclusive; bands near Nyquist are skipped
+    double roughnessMeanCoeff = 0.0;
+    double roughnessPowerCoeff = 0.0;
+
     // ---- Calibration ------------------------------------------------------
     // Every metric is normalised to 0-1 using these reference points. Retune here,
-    // not inside the calculations. Readings with reference signals (44.1 kHz,
-    // stereo, any level from -60 to -20 dBFS):
+    // not inside the calculations. Readings with reference signals at 44.1 kHz,
+    // 100 dB SPL = 0 dBFS RMS (60 dB SPL unless stated):
     //
-    //   signal                   brightness  harshness  dynamics  unpredictability
-    //   sine 250 Hz                  0.17       0.00      0.00        0.00
-    //   sine 1 kHz                   0.50       0.00      0.00        0.00
-    //   sine 4 kHz                   0.83       1.00      0.00        0.00
-    //   white noise                  1.00       0.91      0.01        0.03
-    //   pink noise (steady)          0.79       0.36      0.09        0.23
-    //   pink noise, 4 Hz AM 50%      0.76       0.34      0.21        0.44
-    //   pink noise, 4 Hz AM 100%     0.75       0.32      0.82        1.00
-    //   speech-like bursts           0.77       0.33      0.88        0.57
-
-    // Brightness: power-weighted spectral centroid on a log-frequency axis
-    static constexpr float centroidMinHz = 125.0f;   // maps to 0
-    static constexpr float centroidMaxHz = 8000.0f;  // maps to 1 (6 octaves)
-
-    // Harshness: fraction of spectral power above this frequency (already 0-1)
-    static constexpr float harshnessCrossoverHz = 2000.0f;
+    //   signal                      bri   har   dyn   unp    sone   acum   asper
+    //   1 kHz tone, 40 dB           0.24  0.00  0.00  0.00   1.00   0.97   0.00   (1 sone reference)
+    //   1 kHz tone 100% AM at 70 Hz 0.25  0.25  0.04  0.18   4.90   1.01   1.00   (1 asper reference)
+    //   sine 250 Hz                 0.09  0.00  0.00  0.00   2.86   0.36   0.00
+    //   sine 1 kHz                  0.26  0.00  0.00  0.00   4.52   1.02   0.00
+    //   sine 4 kHz                  0.64  0.12  0.00  0.00   5.83   2.56   0.00
+    //   white noise                 0.60  0.21  0.01  0.02  16.63   2.41   0.18
+    //   pink noise                  0.49  0.21  0.10  0.18  17.33   1.95   0.23
+    //   pink noise, 40 / 80 dB      0.48/0.49  0.08/0.54  .10  .18  4.7/54.8  1.9/2.0  0.15/0.23
+    //   pink noise, 4 Hz AM 100%    0.48  0.19  0.68  1.00   8.85   1.92   0.44
+    //   speech-like bursts, 65 dB   0.49  0.29  1.00  0.85  21.32   1.94   0.39
+    //
+    // Known limits: roughness is a simplified Daniel & Weber model, calibrated at
+    // the 1 asper reference and checked against the published shape (peak near
+    // 70 Hz, rising with depth and level). It under-reads modulation above ~100 Hz,
+    // ignores carriers below ~500 Hz, and values above ~3 asper are unvalidated.
+    // Loudness follows the Zwicker sone scale but has none of the low-frequency
+    // corrections of ISO 532-1, so it reads a little high below ~250 Hz.
+    static constexpr float loudnessScale = 0.9f;            // Makes a 1 kHz tone at 40 dB SPL read 1 sone
+    static constexpr float roughnessScale = 0.51f;          // Raw sum -> asper (1 asper = 1 kHz tone, 70 Hz AM, 100%, 60 dB)
+    static constexpr float roughnessDepthExponent = 1.5f;   // Roughness grows a little faster than linearly with depth
+    static constexpr float roughnessCorrelationExponent = 3.0f; // Suppresses weakly correlated (noise-like) bands
+    static constexpr float sharpnessFullScaleAcum = 4.0f;   // Sharpness that maps to brightness 1
+    static constexpr float roughnessFullScaleAsper = 2.0f;  // Roughness that maps to 1
+    static constexpr float presenceFullScaleSone = 20.0f;   // Loudness in the 2-5 kHz region that maps to 1
+    // Harshness = this much roughness + the rest presence loudness
+    static constexpr float harshnessRoughnessWeight = 0.5f;
 
     // Dynamics are measured in dB, so they don't depend on playback level
     static constexpr float rmsFloorDb = -80.0f;               // floor for silent windows
@@ -136,7 +245,8 @@ private:
         }
     };
 
-    Smoother centroidSmoother, harshnessSmoother, dynamicSmoother, temporalSmoother;
+    Smoother sharpnessSmoother, roughnessSmoother, presenceSmoother, loudnessSmoother,
+             dynamicSmoother, temporalSmoother;
     float smoothingAttackCoeff = 1.0f;
     float smoothingReleaseCoeff = 1.0f;
 
@@ -147,6 +257,9 @@ private:
     std::atomic<float> dynamicVariability{ 0.0f };
     std::atomic<float> temporalUnpredictability{ 0.0f };
     std::atomic<float> acousticActivationScore{ 50.0f }; // 0-100 scale
+    std::atomic<float> loudnessSones{ 0.0f };
+    std::atomic<float> sharpnessAcum{ 0.0f };
+    std::atomic<float> roughnessAsper{ 0.0f };
 
     // Level history for dynamic analysis, in dB. One entry is added per fixed time
     // window (not per audio block), so results don't depend on the host's
@@ -172,6 +285,9 @@ private:
         float dynamicVariability;
         float temporalUnpredictability;
         float rmsLevel;
+        float loudnessSones;
+        float sharpnessAcum;
+        float roughnessAsper;
     };
 
     // Recording is split across two threads so the audio thread never locks or allocates:
@@ -196,8 +312,9 @@ private:
 
     // Analysis functions. Each compute function returns a raw 0-1 value.
     void performFFTAnalysis();
-    float computeSpectralCentroid() const;
-    float computeSpectralHarshness() const;
+    void computeBarkAnalysis(float& loudness, float& sharpness, float& presenceLoudness);
+    float computeRoughness() const;
+    void processRoughnessSample(int channel, float sample);
     float computeDynamicVariability() const;
     float computeTemporalUnpredictability() const;
     static float computeAcousticActivationScore(float centroid, float harshness,
