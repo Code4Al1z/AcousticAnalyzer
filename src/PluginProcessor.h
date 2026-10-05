@@ -2,6 +2,8 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
+#include "LogExporter.h"
+#include "Parameters.h"
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -15,6 +17,10 @@ public:
     AudioPluginAudioProcessor();
     ~AudioPluginAudioProcessor() override;
 
+    // Settings (index weights, zone thresholds, calibration, smoothing) and UI
+    // state, saved with the project
+    juce::AudioProcessorValueTreeState apvts;
+
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
@@ -23,7 +29,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    const juce::String getName() const override { return "Acoustic Environment Research Tool"; }
+    const juce::String getName() const override { return "Acoustic Analyzer"; }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
@@ -51,6 +57,15 @@ public:
     float getSharpnessAcum() const { return sharpnessAcum.load(); }
     float getRoughnessAsper() const { return roughnessAsper.load(); }
 
+    // Share of the signal energy that is not common to both channels: 0 = identical
+    // channels (mono), about 0.5 = unrelated channels, 1 = opposite polarity. Always 0
+    // for a mono input.
+    float getStereoWidth() const { return stereoWidth.load(); }
+
+    // False until audio has arrived, and while the input is digital silence (the other
+    // readings then hold their last values)
+    bool isSignalPresent() const { return signalSeen.load() && !silentNow.load(); }
+
     // Critical band (Bark) layout used by the analysis, shared with the UI
     static constexpr int numBarkBands = 24;
     static constexpr std::array<float, numBarkBands + 1> barkEdgesHz{
@@ -77,7 +92,18 @@ public:
     void startLogging();
     void stopLogging();
     bool isCurrentlyLogging() const { return isLogging.load(); }
-    void exportToCSV();
+    // Message thread only. Recorded frames so far (collects any pending ones first)
+    std::vector<LogDataPoint> getLogSnapshot();
+    // Message thread only. Forget the recorded frames (ignored while recording)
+    void clearLog();
+
+    // Listener rating of how calming the sound is, 1 (not at all) to 7 (very).
+    // Only accepted while recording; it is logged with the frames from then on.
+    void submitRating(int rating);
+    int getCurrentRating() const { return currentRating.load(); }
+    int getRatingCount() const { return ratingCount.load(); }
+    // The settings in force now, for the CSV header
+    LogMetadata getLogMetadata() const;
     double getRecordingTime() const;
     int getDataPointCount() const { return static_cast<int>(dataLog.size()); }
     int getDroppedPointCount() const { return droppedLogPoints.load(); }
@@ -116,9 +142,9 @@ private:
     //    how correlated neighbouring bands are (simplified Daniel & Weber model)
     //
     // Absolute units need a level calibration: SPL when the digital signal has
-    // 0 dBFS RMS (a full-scale sine is 3 dB below that). Set it to match your
-    // monitoring chain; the metrics are only as absolute as this number.
-    static constexpr float referenceSplAtFullScaleRms = 100.0f;
+    // 0 dBFS RMS (a full-scale sine is 3 dB below that). This is the
+    // "calibrationSpl" parameter (default 100 dB). Set it to match your monitoring
+    // chain; the metrics are only as absolute as this number.
 
     // Set in prepareToPlay for the current sample rate
     std::array<int, numBarkBands + 1> barkBinEdges{};              // First FFT bin of each band
@@ -127,8 +153,8 @@ private:
     std::array<float, numBarkBands> specificLoudness{};            // Last frame's sone per Bark
 
     // Roughness filterbank (audio rate, double precision). Only bands from
-    // firstRoughnessBand up are used: below ~500 Hz the carrier is too close to
-    // the modulation range to separate the envelope.
+    // firstRoughnessBand up are used (about 350 Hz and above): below that the carrier is
+    // too close to the modulation range to separate the envelope.
     struct Biquad
     {
         double b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
@@ -173,7 +199,7 @@ private:
         double lastModulation = 0.0;
     };
 
-    static constexpr int firstRoughnessBand = 5;
+    static constexpr int firstRoughnessBand = 3;
     static constexpr double roughnessModulationHz = 70.0;
     static constexpr double roughnessModulationQ = 0.7;
     static constexpr double roughnessEnvelopeCutoffHz = 500.0;
@@ -188,34 +214,44 @@ private:
 
     // ---- Calibration ------------------------------------------------------
     // Every metric is normalised to 0-1 using these reference points. Retune here,
-    // not inside the calculations. Readings with reference signals at 44.1 kHz,
+    // not inside the calculations. Readings with reference signals at 48 kHz,
     // 100 dB SPL = 0 dBFS RMS (60 dB SPL unless stated):
     //
     //   signal                      bri   har   dyn   unp    sone   acum   asper
-    //   1 kHz tone, 40 dB           0.24  0.00  0.00  0.00   1.00   0.97   0.00   (1 sone reference)
-    //   1 kHz tone 100% AM at 70 Hz 0.25  0.25  0.04  0.18   4.90   1.01   1.00   (1 asper reference)
-    //   sine 250 Hz                 0.09  0.00  0.00  0.00   2.86   0.36   0.00
-    //   sine 1 kHz                  0.26  0.00  0.00  0.00   4.52   1.02   0.00
-    //   sine 4 kHz                  0.64  0.12  0.00  0.00   5.83   2.56   0.00
-    //   white noise                 0.60  0.21  0.01  0.02  16.63   2.41   0.18
-    //   pink noise                  0.49  0.21  0.10  0.18  17.33   1.95   0.23
-    //   pink noise, 40 / 80 dB      0.48/0.49  0.08/0.54  .10  .18  4.7/54.8  1.9/2.0  0.15/0.23
-    //   pink noise, 4 Hz AM 100%    0.48  0.19  0.68  1.00   8.85   1.92   0.44
-    //   speech-like bursts, 65 dB   0.49  0.29  1.00  0.85  21.32   1.94   0.39
+    //   1 kHz tone, 40 dB           0.24  0.00  0.00  0.00   0.82   0.96   0.00
+    //   1 kHz tone 100% AM at 70 Hz 0.24  0.24  0.04  0.18   4.48   0.97   0.98   (1 asper reference)
+    //   sine 250 Hz                 0.09  0.00  0.00  0.00   2.39   0.34   0.01
+    //   sine 1 kHz                  0.25  0.00  0.00  0.00   3.86   1.00   0.00
+    //   sine 4 kHz                  0.62  0.11  0.00  0.00   5.18   2.48   0.00
+    //   white noise                 0.60  0.18  0.01  0.03  14.91   2.41   0.08
+    //   pink noise, 40 dB           0.48  0.05  0.16  0.21   3.47   1.90   0.04
+    //   pink noise, 60 dB           0.48  0.15  0.13  0.25  14.64   1.94   0.08
+    //   pink noise, 80 dB           0.49  0.45  0.16  0.25  48.86   1.97   0.09
+    //   pink noise, 4 Hz AM 50%     0.48  0.16  0.29  0.57  15.34   1.94   0.10
+    //   pink noise, 4 Hz AM 100%    0.48  0.17  0.66  1.00  15.15   1.93   0.15
+    //   speech-like bursts, 65 dB   0.48  0.21  0.99  0.87  17.50   1.93   0.20
     //
-    // Known limits: roughness is a simplified Daniel & Weber model, calibrated at
-    // the 1 asper reference and checked against the published shape (peak near
-    // 70 Hz, rising with depth and level). It under-reads modulation above ~100 Hz,
-    // ignores carriers below ~500 Hz, and values above ~3 asper are unvalidated.
-    // Loudness follows the Zwicker sone scale but has none of the low-frequency
-    // corrections of ISO 532-1, so it reads a little high below ~250 Hz.
-    static constexpr float loudnessScale = 0.9f;            // Makes a 1 kHz tone at 40 dB SPL read 1 sone
-    static constexpr float roughnessScale = 0.51f;          // Raw sum -> asper (1 asper = 1 kHz tone, 70 Hz AM, 100%, 60 dB)
-    static constexpr float roughnessDepthExponent = 1.5f;   // Roughness grows a little faster than linearly with depth
-    static constexpr float roughnessCorrelationExponent = 3.0f; // Suppresses weakly correlated (noise-like) bands
+    // Checked against MoSQITo (ISO 532-1 loudness, DIN 45692 sharpness, Daniel & Weber
+    // roughness) on 57 calibrated test signals; tools/validation repeats the comparison.
+    // Plugin / reference:
+    //   sharpness  median 0.95, every signal within 20%, rank correlation 0.97
+    //   loudness   median 1.00, 64% within 20% and 86% within 35%, rank correlation 0.99.
+    //              Tones from 30 to 80 dB are mostly within 25%; it reads high for broadband
+    //              noise (about 1.5 to 2 times, more at low levels) and for 2 kHz tones, and low
+    //              around 250 Hz. A 1 kHz tone at 40 dB reads 0.82 sone (ISO: 1.0): the scale is
+    //              fitted for the smallest overall error rather than anchored on that one tone.
+    //   roughness  median 1.09 and rank correlation 0.96 on the signals the reference rates
+    //              above 0.1 asper. The reference tone, the modulation-frequency curve
+    //              (10-300 Hz), depth and carrier (250 Hz-8 kHz) are mostly within 25%.
+    //              Steady noise reads 0.04-0.09 asper (reference 0.02). Broadband noise
+    //              modulated at 70 Hz reads about 3 times too high.
+    static constexpr float loudnessScale = 1.2f;            // Fitted against ISO 532-1 (see the notes above); a 1 kHz tone at 40 dB SPL reads 0.8 sone
+    static constexpr float roughnessScale = 0.60f;          // Raw sum -> asper (1 asper = 1 kHz tone, 70 Hz AM, 100%, 60 dB)
+    static constexpr float roughnessDepthExponent = 1.3f;   // Roughness grows a little faster than linearly with depth
+    static constexpr float roughnessCorrelationExponent = 5.0f; // Suppresses weakly correlated (noise-like) bands
     static constexpr float sharpnessFullScaleAcum = 4.0f;   // Sharpness that maps to brightness 1
     static constexpr float roughnessFullScaleAsper = 2.0f;  // Roughness that maps to 1
-    static constexpr float presenceFullScaleSone = 20.0f;   // Loudness in the 2-5 kHz region that maps to 1
+    static constexpr float presenceFullScaleSone = 17.0f;   // Loudness in the 2-5 kHz region that maps to 1
     // Harshness = this much roughness + the rest presence loudness
     static constexpr float harshnessRoughnessWeight = 0.5f;
 
@@ -228,9 +264,8 @@ private:
     // silence: the metrics hold their last value instead of jumping to "calm"
     static constexpr float silenceMeanSquare = 1.0e-8f;
 
-    // Meter smoothing (one-pole filter, applied once per FFT frame)
-    static constexpr float smoothingAttackSeconds = 0.1f;
-    static constexpr float smoothingReleaseSeconds = 0.4f;
+    // Meter smoothing: one-pole filter applied once per FFT frame, with attack and
+    // release times taken from the parameters (defaults 100 ms and 400 ms)
 
     struct Smoother
     {
@@ -254,9 +289,20 @@ private:
     };
 
     Smoother sharpnessSmoother, roughnessSmoother, presenceSmoother, loudnessSmoother,
-             dynamicSmoother, temporalSmoother;
+             dynamicSmoother, temporalSmoother, widthSmoother;
     float smoothingAttackCoeff = 1.0f;
     float smoothingReleaseCoeff = 1.0f;
+
+    // Parameter values, read on the audio thread
+    static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+    std::atomic<float>* weightBrightnessValue = nullptr;
+    std::atomic<float>* weightHarshnessValue = nullptr;
+    std::atomic<float>* weightDynamicsValue = nullptr;
+    std::atomic<float>* weightUnpredictabilityValue = nullptr;
+    std::atomic<float>* calibrationSplValue = nullptr;
+    std::atomic<float>* smoothingAttackValue = nullptr;
+    std::atomic<float>* smoothingReleaseValue = nullptr;
 
     // Analysis parameters (atomic for thread safety)
     std::atomic<float> spectralCentroid{ 0.0f };
@@ -285,28 +331,14 @@ private:
     double currentSampleRate = 44100.0;
 
     // Data logging
-    struct DataPoint
-    {
-        double timestamp;
-        float activationScore;
-        float spectralCentroid;
-        float spectralHarshness;
-        float dynamicVariability;
-        float temporalUnpredictability;
-        float rmsLevel;
-        float loudnessSones;
-        float sharpnessAcum;
-        float roughnessAsper;
-    };
-
     // Recording is split across two threads so the audio thread never locks or allocates:
-    //  - audio thread: pushes DataPoints into a fixed-size lock-free FIFO
+    //  - audio thread: pushes LogDataPoints into a fixed-size lock-free FIFO
     //  - message thread: drains the FIFO into dataLog (timer, stop and export)
     // dataLog is only ever touched on the message thread.
     static constexpr int logFifoCapacity = 8192; // ~3 minutes between drains at 44.1 kHz
     juce::AbstractFifo logFifo{ logFifoCapacity };
-    std::array<DataPoint, logFifoCapacity> logFifoStorage{};
-    std::vector<DataPoint> dataLog;
+    std::array<LogDataPoint, logFifoCapacity> logFifoStorage{};
+    std::vector<LogDataPoint> dataLog;
     std::atomic<int> droppedLogPoints{ 0 };
 
     std::atomic<bool> isLogging{ false };
@@ -316,8 +348,19 @@ private:
     juce::int64 samplesProcessed = 0; // audio thread only
     std::atomic<juce::int64> samplesProcessedPublished{ 0 }; // updated once per block
 
-    void timerCallback() override { drainLogFifo(); }
+    void timerCallback() override; // Message thread, 10 Hz: collects frames, runs auto-record
     void drainLogFifo();
+
+    std::atomic<int> currentRating{ 0 };       // 0 = none
+    std::atomic<bool> ratingEventPending{ false };
+    std::atomic<int> ratingCount{ 0 };
+    std::atomic<bool> signalSeen{ false };      // A non-silent frame has been analysed
+    std::atomic<bool> silentNow{ true };        // The latest frame was digital silence
+    std::atomic<float> stereoWidth{ 0.0f };
+    double sumMid = 0.0, sumSide = 0.0;         // Audio thread: energy of (L+R)/2 and (L-R)/2 in the current window
+    float latestWidth = 0.0f;                   // Last completed window's width, before smoothing
+    std::atomic<bool> autoRecordFired{ false }; // Auto-record has already started a recording
+    std::atomic<float>* autoRecordValue = nullptr;
 
     // Analysis functions. Each compute function returns a raw 0-1 value.
     void performFFTAnalysis();
@@ -326,8 +369,8 @@ private:
     void processRoughnessSample(int channel, float sample);
     float computeDynamicVariability() const;
     float computeTemporalUnpredictability() const;
-    static float computeAcousticActivationScore(float centroid, float harshness,
-                                                float dynamics, float unpredictability);
+    float computeAcousticActivationScore(float centroid, float harshness,
+                                         float dynamics, float unpredictability) const;
     void logDataPoint();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioPluginAudioProcessor)

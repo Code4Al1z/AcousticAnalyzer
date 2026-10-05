@@ -143,7 +143,9 @@ namespace ui
                     juce::Path bar;
                     const float corner = juce::jmin(4.0f, height * 0.5f, barWidth * 0.5f);
                     bar.addRoundedRectangle(x, plot.getBottom() - height, barWidth, height, corner, corner, true, true, false, false);
-                    g.setColour(i == hoverBand ? palette::seriesBlue.brighter(0.25f) : palette::seriesBlue);
+                    // Brand gradient across the bands: orange at the low end, pink at the high end
+                    const auto barColour = palette::brandGradient(static_cast<float>(i) / (numBands - 1));
+                    g.setColour(i == hoverBand ? barColour.brighter(0.3f) : barColour);
                     g.fillPath(bar);
                 }
 

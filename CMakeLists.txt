@@ -83,6 +83,30 @@ target_link_libraries(AcousticAnalyzer
         juce::juce_recommended_warning_flags
 )
 
+# ------------------------------------------------------------------------------
+# Optional: a console program that feeds test signals through the processor, so the
+# psychoacoustic metrics can be compared with a reference implementation
+# (see tools/validation/README.md). Off by default.
+# ------------------------------------------------------------------------------
+option(ACOUSTIC_BUILD_VALIDATION "Build the validation harness from tools/validation" OFF)
+
+if(ACOUSTIC_BUILD_VALIDATION)
+    juce_add_console_app(ValidationHarness PRODUCT_NAME "ValidationHarness")
+
+    target_sources(ValidationHarness PRIVATE tools/validation/ValidationHarness.cpp ${SOURCES})
+    target_include_directories(ValidationHarness PRIVATE src)
+    target_compile_definitions(ValidationHarness PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_MODAL_LOOPS_PERMITTED=1)
+    target_link_libraries(ValidationHarness PRIVATE
+        juce::juce_audio_utils
+        juce::juce_audio_processors
+        juce::juce_dsp
+        juce::juce_gui_extra
+        juce::juce_recommended_config_flags)
+endif()
+
 target_compile_features(AcousticAnalyzer PUBLIC cxx_std_17)
 
 target_compile_definitions(AcousticAnalyzer

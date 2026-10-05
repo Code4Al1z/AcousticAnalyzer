@@ -2,6 +2,8 @@
 
 #include "Theme.h"
 #include <array>
+#include <functional>
+#include <vector>
 
 namespace ui
 {
@@ -11,24 +13,28 @@ namespace ui
     class HistoryGraph : public juce::Component
     {
     public:
-        enum SeriesId { index = 0, brightness, harshness, dynamics, unpredictability, numSeries };
+        enum SeriesId { index = 0, brightness, harshness, dynamics, unpredictability, rating, numSeries };
 
-        static constexpr int capacity = 600;           // Samples kept
+        static constexpr int capacity = 3000;          // Samples kept: 5 minutes at 10 Hz
         static constexpr float secondsPerSample = 0.1f; // 10 Hz, so 60 seconds in total
 
         HistoryGraph()
         {
             series[index]            = { "Index",            palette::textPrimary };
-            series[brightness]       = { "Brightness",       palette::seriesBlue };
+            series[brightness]       = { "Brightness",       palette::seriesCyan };
             series[harshness]        = { "Harshness",        palette::seriesOrange };
-            series[dynamics]         = { "Dynamics",         palette::seriesAqua };
-            series[unpredictability] = { "Unpredictability", palette::seriesYellow };
+            series[dynamics]         = { "Dynamics",         palette::seriesViolet };
+            series[unpredictability] = { "Unpredictability", palette::seriesPink };
+            series[rating]           = { "Rating",           palette::seriesYellow };
+
+            setWantsKeyboardFocus(true);
 
             setTitle("History graph");
             setDescription("Scrolling graph of the activation index and its metrics over the last 60 seconds");
         }
 
-        // Values are 0-100 for every series
+        // Values are 0-100 for every series. The rating series is a rating mapped from
+        // 1-7 onto 0-100, or negative when there is no rating yet.
         void push(const std::array<float, numSeries>& values, bool recording)
         {
             samples[static_cast<size_t>(head)] = values;
@@ -47,16 +53,46 @@ namespace ui
 
         int getNumSamples() const { return count; }
 
+        // How much history the graph shows: 30, 60 or 300 seconds (all of it stays in the table)
+        void setWindowSeconds(int seconds)
+        {
+            windowSeconds = seconds <= 30 ? 30 : seconds <= 60 ? 60 : 300;
+            windowSamples = juce::jlimit(2, capacity, juce::roundToInt(static_cast<float>(windowSeconds) / secondsPerSample));
+            hoverAge = -1;
+            repaint();
+        }
+
+        int getWindowSeconds() const { return windowSeconds; }
+
+        struct Sample
+        {
+            std::array<float, numSeries> values{};
+            bool recording = false;
+        };
+
+        // age 0 is the newest sample
+        Sample getSampleAtAge(int age) const
+        {
+            const auto i = static_cast<size_t>((head - 1 - age + capacity * 2) % capacity);
+            return { samples[i], recordingFlags[i] };
+        }
+
+        static const char* getSeriesName(int id)
+        {
+            static const char* names[] = { "Index", "Brightness", "Harshness", "Dynamics", "Unpredictability", "Rating" };
+            return names[id];
+        }
+
         // Hover position in component coordinates; pass { -1, -1 } to clear
         void setHoverPosition(juce::Point<float> position)
         {
             const auto plot = getPlotArea();
             int newAge = -1;
 
-            if (count > 0 && plot.expanded(0.0f, 4.0f).contains(position))
+            if (visible() > 0 && plot.expanded(0.0f, 4.0f).contains(position))
             {
-                const float dx = plot.getWidth() / static_cast<float>(capacity - 1);
-                newAge = juce::jlimit(0, count - 1, juce::roundToInt((plot.getRight() - position.x) / dx));
+                const float dx = plot.getWidth() / static_cast<float>(windowSamples - 1);
+                newAge = juce::jlimit(0, visible() - 1, juce::roundToInt((plot.getRight() - position.x) / dx));
             }
 
             if (newAge != hoverAge)
@@ -71,6 +107,11 @@ namespace ui
             series[id].visible = visible;
             repaint();
         }
+
+        bool isSeriesVisible(SeriesId id) const { return series[id].visible; }
+
+        // Called after the user shows or hides a series by clicking its legend chip
+        std::function<void()> onSeriesVisibilityChanged;
 
         void resized() override
         {
@@ -90,7 +131,7 @@ namespace ui
             drawGridAndAxes(g, plot);
             drawLegend(g);
 
-            if (count < 2)
+            if (visible() < 2)
             {
                 g.setColour(palette::textMuted);
                 g.setFont(font(13.0f));
@@ -127,12 +168,34 @@ namespace ui
 
         void mouseExit(const juce::MouseEvent&) override { setHoverPosition({ -1.0f, -1.0f }); }
 
+        // Keyboard: Left/Right choose a legend chip, Space or Enter shows/hides its series
+        bool keyPressed(const juce::KeyPress& key) override
+        {
+            if (key == juce::KeyPress::leftKey)
+                focusedChip = (focusedChip + numSeries - 1) % numSeries;
+            else if (key == juce::KeyPress::rightKey)
+                focusedChip = (focusedChip + 1) % numSeries;
+            else if (key == juce::KeyPress::spaceKey || key == juce::KeyPress::returnKey)
+                toggleSeries(focusedChip);
+            else
+                return false;
+
+            repaint();
+            return true;
+        }
+
+        void focusGained(FocusChangeType) override { repaint(); }
+        void focusLost(FocusChangeType) override { repaint(); }
+
         void mouseUp(const juce::MouseEvent& e) override
         {
             const int chip = chipAt(e.position);
 
             if (chip >= 0)
-                setSeriesVisible(static_cast<SeriesId>(chip), !series[chip].visible);
+            {
+                focusedChip = chip;
+                toggleSeries(chip);
+            }
         }
 
     private:
@@ -142,6 +205,17 @@ namespace ui
             juce::Colour colour;
             bool visible = true;
         };
+
+        // Samples inside the displayed window
+        int visible() const { return juce::jmin(count, windowSamples); }
+
+        void toggleSeries(int id)
+        {
+            setSeriesVisible(static_cast<SeriesId>(id), !series[id].visible);
+
+            if (onSeriesVisibilityChanged)
+                onSeriesVisibilityChanged();
+        }
 
         juce::Rectangle<float> getPlotArea() const
         {
@@ -160,7 +234,7 @@ namespace ui
 
         float xForAge(const juce::Rectangle<float>& plot, int age) const
         {
-            return plot.getRight() - static_cast<float>(age) * plot.getWidth() / static_cast<float>(capacity - 1);
+            return plot.getRight() - static_cast<float>(age) * plot.getWidth() / static_cast<float>(windowSamples - 1);
         }
 
         float yForValue(const juce::Rectangle<float>& plot, float value) const
@@ -193,10 +267,16 @@ namespace ui
                            juce::Justification::centredRight);
             }
 
-            for (int seconds : { 60, 45, 30, 15, 0 })
+            const std::vector<int> ticks = windowSeconds == 30 ? std::vector<int>{ 30, 20, 10, 0 }
+                                         : windowSeconds == 300 ? std::vector<int>{ 300, 240, 180, 120, 60, 0 }
+                                                                : std::vector<int>{ 60, 45, 30, 15, 0 };
+
+            for (int seconds : ticks)
             {
-                const float x = plot.getRight() - static_cast<float>(seconds) / 60.0f * plot.getWidth();
-                const auto label = seconds == 0 ? juce::String("now") : "-" + juce::String(seconds) + " s";
+                const float x = plot.getRight() - static_cast<float>(seconds) / static_cast<float>(windowSeconds) * plot.getWidth();
+                const auto label = seconds == 0 ? juce::String("now")
+                                 : seconds >= 120 ? "-" + juce::String(seconds / 60) + " min"
+                                                  : "-" + juce::String(seconds) + " s";
 
                 g.setColour(palette::textMuted);
                 g.drawText(label, juce::Rectangle<float>(x - 24.0f, plot.getBottom() + 4.0f, 48.0f, 14.0f),
@@ -211,8 +291,9 @@ namespace ui
                 const auto chip = chipBounds[s];
                 const bool visible = series[s].visible;
 
-                g.setColour(palette::outline);
-                g.drawRoundedRectangle(chip.reduced(0.5f), 6.0f, 1.0f);
+                const bool focused = hasKeyboardFocus(false) && s == focusedChip;
+                g.setColour(focused ? palette::textPrimary : palette::outline);
+                g.drawRoundedRectangle(chip.reduced(0.5f), 6.0f, focused ? 2.0f : 1.0f);
 
                 // Line key in the series colour; the text stays in a text token
                 g.setColour(series[s].colour.withAlpha(visible ? 1.0f : 0.3f));
@@ -247,7 +328,7 @@ namespace ui
                 spanEnd = -1;
             };
 
-            for (int age = 0; age < count; ++age)
+            for (int age = 0; age < visible(); ++age)
             {
                 if (recordingAt(age))
                 {
@@ -259,7 +340,7 @@ namespace ui
                     flush(age - 1);
                 }
             }
-            flush(count - 1);
+            flush(visible() - 1);
 
             if (lastSpanStartAge >= 0)
             {
@@ -274,14 +355,26 @@ namespace ui
         {
             juce::Path path;
 
-            for (int age = count - 1; age >= 0; --age)
-            {
-                const juce::Point<float> p(xForAge(plot, age), yForValue(plot, valueAt(seriesId, age)));
+            bool drawing = false;
 
-                if (age == count - 1)
-                    path.startNewSubPath(p);
-                else
+            for (int age = visible() - 1; age >= 0; --age)
+            {
+                const float value = valueAt(seriesId, age);
+
+                if (value < 0.0f) // No value (a rating not given yet): leave a gap
+                {
+                    drawing = false;
+                    continue;
+                }
+
+                const juce::Point<float> p(xForAge(plot, age), yForValue(plot, value));
+
+                if (drawing)
                     path.lineTo(p);
+                else
+                    path.startNewSubPath(p);
+
+                drawing = true;
             }
 
             return path;
@@ -291,7 +384,7 @@ namespace ui
         {
             auto path = makePath(plot, seriesId);
             path.lineTo(xForAge(plot, 0), plot.getBottom());
-            path.lineTo(xForAge(plot, count - 1), plot.getBottom());
+            path.lineTo(xForAge(plot, visible() - 1), plot.getBottom());
             path.closeSubPath();
 
             g.setColour(series[seriesId].colour.withAlpha(0.10f));
@@ -303,6 +396,19 @@ namespace ui
             g.setColour(series[seriesId].colour);
             g.strokePath(makePath(plot, seriesId),
                          juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+            // A dot wherever a new rating was entered
+            if (seriesId == rating)
+            {
+                for (int age = visible() - 1; age >= 0; --age)
+                {
+                    const float value = valueAt(rating, age);
+                    const float before = age + 1 < visible() ? valueAt(rating, age + 1) : -1.0f;
+
+                    if (value >= 0.0f && !juce::approximatelyEqual(value, before))
+                        drawRingedDot(g, { xForAge(plot, age), yForValue(plot, value) }, 3.5f, series[rating].colour);
+                }
+            }
         }
 
         void drawEndLabels(juce::Graphics& g, const juce::Rectangle<float>& plot) const
@@ -313,7 +419,7 @@ namespace ui
 
             for (int s = 0; s < numSeries; ++s)
             {
-                if (!series[s].visible)
+                if (!series[s].visible || valueAt(s, 0) < 0.0f)
                     continue;
 
                 const float y = yForValue(plot, valueAt(s, 0));
@@ -347,6 +453,9 @@ namespace ui
 
         static juce::String formatValue(int seriesId, float value)
         {
+            if (seriesId == rating)
+                return value < 0.0f ? juce::String("-") : juce::String(juce::roundToInt(value / 100.0f * 6.0f + 1.0f)) + " / 7";
+
             return seriesId == index ? juce::String(value, 1) : juce::String(juce::roundToInt(value)) + "%";
         }
 
@@ -363,7 +472,9 @@ namespace ui
                 if (!series[s].visible)
                     continue;
 
-                drawRingedDot(g, { x, yForValue(plot, valueAt(s, hoverAge)) }, 4.0f, series[s].colour);
+                if (valueAt(s, hoverAge) >= 0.0f)
+                    drawRingedDot(g, { x, yForValue(plot, valueAt(s, hoverAge)) }, 4.0f, series[s].colour);
+
                 ++rows;
             }
 
@@ -416,6 +527,9 @@ namespace ui
         std::array<bool, capacity> recordingFlags{};
         int head = 0;       // Next write index
         int count = 0;      // Valid samples
+        int windowSeconds = 60;
+        int windowSamples = 600;
         int hoverAge = -1;  // Samples back from the newest, or -1
+        int focusedChip = 0; // Legend chip the keyboard acts on
     };
 }

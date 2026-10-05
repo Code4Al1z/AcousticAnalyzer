@@ -6,8 +6,12 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
     : AudioProcessor(BusesProperties()
         .withInput("Input", juce::AudioChannelSet::stereo(), true)
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+    apvts(*this, nullptr, "AcousticAnalyzerState", createParameterLayout()),
     fft(fftOrder),
-    window(fftSize, juce::dsp::WindowingFunction<float>::hann)
+    // normalise = false: the level calculations assume a plain Hann window (coherent gain 0.5).
+    // JUCE's default normalisation doubles the amplitude, which made every SPL-based
+    // reading 6 dB too high.
+    window(fftSize, juce::dsp::WindowingFunction<float>::hann, false)
 {
     for (auto& channel : fftInput)
         channel.fill(0.0f);
@@ -17,13 +21,66 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 
     for (auto& band : sharedSpecificLoudness)
         band.store(0.0f);
+
+    weightBrightnessValue = apvts.getRawParameterValue(params::weightBrightness);
+    weightHarshnessValue = apvts.getRawParameterValue(params::weightHarshness);
+    weightDynamicsValue = apvts.getRawParameterValue(params::weightDynamics);
+    weightUnpredictabilityValue = apvts.getRawParameterValue(params::weightUnpredictability);
+    calibrationSplValue = apvts.getRawParameterValue(params::calibrationSpl);
+    smoothingAttackValue = apvts.getRawParameterValue(params::smoothingAttack);
+    smoothingReleaseValue = apvts.getRawParameterValue(params::smoothingRelease);
+    autoRecordValue = apvts.getRawParameterValue(params::autoRecord);
+
+    startTimerHz(10);
 }
 
-AudioPluginAudioProcessor::~AudioPluginAudioProcessor() {}
+juce::AudioProcessorValueTreeState::ParameterLayout AudioPluginAudioProcessor::createParameterLayout()
+{
+    // These are settings, not performance controls, so they are not offered to
+    // host automation. They are still saved with the project.
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+    auto add = [&layout](const char* id, const juce::String& name, juce::NormalisableRange<float> range,
+                         float defaultValue, const juce::String& unit)
+    {
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            juce::ParameterID{ id, 1 }, name, range, defaultValue,
+            juce::AudioParameterFloatAttributes().withLabel(unit).withAutomatable(false)));
+    };
+
+    // Relative weights of the four metrics in the activation index (normalised when used)
+    add(params::weightBrightness,       "Weight: Brightness",       { 0.0f, 100.0f, 1.0f }, 25.0f, "");
+    add(params::weightHarshness,        "Weight: Harshness",        { 0.0f, 100.0f, 1.0f }, 35.0f, "");
+    add(params::weightDynamics,         "Weight: Dynamics",         { 0.0f, 100.0f, 1.0f }, 20.0f, "");
+    add(params::weightUnpredictability, "Weight: Unpredictability", { 0.0f, 100.0f, 1.0f }, 20.0f, "");
+
+    // Gauge zones
+    add(params::calmAbove,    "Calming above",  { 0.0f, 100.0f, 1.0f }, 70.0f, "");
+    add(params::neutralAbove, "Neutral above",  { 0.0f, 100.0f, 1.0f }, 40.0f, "");
+
+    // Analysis
+    add(params::calibrationSpl,   "Calibration (dB SPL at 0 dBFS RMS)", { 60.0f, 130.0f, 0.5f }, 100.0f, "dB");
+    add(params::smoothingAttack,  "Smoothing attack",  { 10.0f, 1000.0f, 1.0f, 0.4f }, 100.0f, "ms");
+    add(params::smoothingRelease, "Smoothing release", { 50.0f, 3000.0f, 1.0f, 0.4f }, 400.0f, "ms");
+
+    // Workflow: start recording by itself when audio first arrives
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID{ params::autoRecord, 1 }, "Auto-record", false,
+        juce::AudioParameterBoolAttributes().withAutomatable(false)));
+
+    return layout;
+}
+
+AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
+{
+    stopTimer();
+}
 
 void AudioPluginAudioProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/)
 {
     currentSampleRate = sampleRate;
+    signalSeen.store(false);
+    autoRecordFired.store(false); // Playback restarted: auto-record may start a new recording
 
     // Level history
     rmsWindowSamples = juce::jmax(1, juce::roundToInt(sampleRate * rmsWindowSeconds));
@@ -43,10 +100,13 @@ void AudioPluginAudioProcessor::prepareToPlay(double sampleRate, int /*samplesPe
     fftScratch.fill(0.0f);
     powerSpectrum.fill(0.0f);
 
-    // Smoothing: convert the time constants to per-frame coefficients
-    const double hopSeconds = hopSize / sampleRate;
-    smoothingAttackCoeff = static_cast<float>(1.0 - std::exp(-hopSeconds / smoothingAttackSeconds));
-    smoothingReleaseCoeff = static_cast<float>(1.0 - std::exp(-hopSeconds / smoothingReleaseSeconds));
+    // Smoothing coefficients follow the parameters and are updated every frame
+    widthSmoother.reset();
+    sumMid = sumSide = 0.0;
+    latestWidth = 0.0f;
+    silentNow.store(true);
+    stereoWidth.store(0.0f);
+
     sharpnessSmoother.reset();
     roughnessSmoother.reset();
     presenceSmoother.reset();
@@ -136,13 +196,23 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
     for (int i = 0; i < buffer.getNumSamples(); ++i)
     {
         float sumOfSquares = 0.0f;
+        float channelSamples[maxAnalysisChannels] = {};
 
         for (int ch = 0; ch < analysisChannels; ++ch)
         {
             const float sample = buffer.getReadPointer(ch)[i];
+            channelSamples[ch] = sample;
             fftInput[static_cast<size_t>(ch)][static_cast<size_t>(fftPos)] = sample;
             sumOfSquares += sample * sample;
             processRoughnessSample(ch, sample);
+        }
+
+        if (analysisChannels == 2) // Mid and side energy, for the stereo width
+        {
+            const double mid = 0.5 * (static_cast<double>(channelSamples[0]) + channelSamples[1]);
+            const double side = 0.5 * (static_cast<double>(channelSamples[0]) - channelSamples[1]);
+            sumMid += mid * mid;
+            sumSide += side * side;
         }
 
         ++samplesProcessed;
@@ -161,6 +231,12 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
 
             rmsSumOfSquares = 0.0;
             rmsSampleCount = 0;
+
+            // Stereo width for this window; held through silence
+            const double energy = sumMid + sumSide;
+            if (analysisChannels == 2 && energy > 1.0e-12 * rmsWindowSamples)
+                latestWidth = static_cast<float>(sumSide / energy);
+            sumMid = sumSide = 0.0;
         }
 
         // FFT frame collection (circular buffers, overlapping frames)
@@ -190,6 +266,8 @@ void AudioPluginAudioProcessor::performFFTAnalysis()
     // Digital silence: hold the last values rather than reporting "calm"
     if (sumOfSquares / (static_cast<double>(fftSize) * analysisChannels) < silenceMeanSquare)
     {
+        silentNow.store(true, std::memory_order_relaxed);
+
         for (auto& band : sharedSpecificLoudness) // The band display should show the silence
             band.store(0.0f, std::memory_order_relaxed);
 
@@ -197,6 +275,9 @@ void AudioPluginAudioProcessor::performFFTAnalysis()
             logDataPoint();
         return;
     }
+
+    signalSeen.store(true, std::memory_order_relaxed);
+    silentNow.store(false, std::memory_order_relaxed);
 
     // One FFT per channel; the power spectra are averaged
     powerSpectrum.fill(0.0f);
@@ -224,6 +305,11 @@ void AudioPluginAudioProcessor::performFFTAnalysis()
         }
     }
 
+    // Smoothing: convert the attack and release times (ms) to per-frame coefficients
+    const double hopSeconds = hopSize / currentSampleRate;
+    smoothingAttackCoeff = static_cast<float>(1.0 - std::exp(-hopSeconds / (0.001 * smoothingAttackValue->load())));
+    smoothingReleaseCoeff = static_cast<float>(1.0 - std::exp(-hopSeconds / (0.001 * smoothingReleaseValue->load())));
+
     // Psychoacoustic analysis, then smoothed so the meters are stable
     float loudness = 0.0f, sharpness = 0.0f, presenceLoudness = 0.0f;
     computeBarkAnalysis(loudness, sharpness, presenceLoudness);
@@ -240,6 +326,7 @@ void AudioPluginAudioProcessor::performFFTAnalysis()
         smoothingAttackCoeff, smoothingReleaseCoeff);
     const float smoothedPresence = presenceSmoother.process(presenceLoudness,
         smoothingAttackCoeff, smoothingReleaseCoeff);
+    stereoWidth.store(widthSmoother.process(latestWidth, smoothingAttackCoeff, smoothingReleaseCoeff));
     const float dynamics = dynamicSmoother.process(computeDynamicVariability(),
         smoothingAttackCoeff, smoothingReleaseCoeff);
     const float unpredictability = temporalSmoother.process(computeTemporalUnpredictability(),
@@ -282,7 +369,7 @@ void AudioPluginAudioProcessor::computeBarkAnalysis(float& loudness, float& shar
             power += powerSpectrum[static_cast<size_t>(bin)];
 
         const double meanSquare = juce::jmax(power * powerToMeanSquare, 1.0e-20);
-        const double splDb = referenceSplAtFullScaleRms + 10.0 * std::log10(meanSquare);
+        const double splDb = calibrationSplValue->load() + 10.0 * std::log10(meanSquare);
 
         bandSplDb[static_cast<size_t>(b)] = static_cast<float>(splDb);
         intensity[static_cast<size_t>(b)] = std::pow(10.0, splDb / 10.0);
@@ -475,21 +562,30 @@ float AudioPluginAudioProcessor::computeTemporalUnpredictability() const
 }
 
 float AudioPluginAudioProcessor::computeAcousticActivationScore(float centroid, float harshness,
-                                                                float dynamics, float unpredictability)
+                                                                float dynamics, float unpredictability) const
 {
-    // Composite score: lower values for stress-inducing features
-    // Research-based weights (these are initial estimates - refine with your research!)
+    // Composite score: lower values for stress-inducing features. The weights are
+    // parameters (refine them with your research) and are normalised here, so
+    // only their ratios matter.
+    float weightB = weightBrightnessValue->load();
+    float weightH = weightHarshnessValue->load();
+    float weightD = weightDynamicsValue->load();
+    float weightU = weightUnpredictabilityValue->load();
+    float totalWeight = weightB + weightH + weightD + weightU;
 
-    float centroidScore = (1.0f - centroid) * 100.0f; // Lower centroid = calmer
-    float harshnessScore = (1.0f - harshness) * 100.0f; // Lower harshness = better
-    float dynamicScore = (1.0f - dynamics) * 100.0f; // Lower variability = calmer
-    float unpredictScore = (1.0f - unpredictability) * 100.0f; // More predictable = calmer
+    if (totalWeight <= 0.0f) // All zero: fall back to equal weights
+    {
+        weightB = weightH = weightD = weightU = 1.0f;
+        totalWeight = 4.0f;
+    }
 
-    // Weighted average (adjust weights based on your research)
-    float score = (centroidScore * 0.25f +
-        harshnessScore * 0.35f +
-        dynamicScore * 0.20f +
-        unpredictScore * 0.20f);
+    const float brightnessScore = (1.0f - centroid) * 100.0f;        // Lower brightness = calmer
+    const float harshnessScore = (1.0f - harshness) * 100.0f;        // Lower harshness = better
+    const float dynamicScore = (1.0f - dynamics) * 100.0f;           // Lower variability = calmer
+    const float unpredictScore = (1.0f - unpredictability) * 100.0f; // More predictable = calmer
+
+    const float score = (brightnessScore * weightB + harshnessScore * weightH
+                         + dynamicScore * weightD + unpredictScore * weightU) / totalWeight;
 
     return juce::jlimit(0.0f, 100.0f, score);
 }
@@ -501,17 +597,60 @@ void AudioPluginAudioProcessor::startLogging()
     drainLogFifo();
     dataLog.clear();
     droppedLogPoints.store(0);
+    currentRating.store(0);
+    ratingEventPending.store(false);
+    ratingCount.store(0);
 
     loggingStartSample.store(samplesProcessedPublished.load());
     isLogging.store(true);
-    startTimerHz(10);
 }
 
 void AudioPluginAudioProcessor::stopLogging()
 {
     isLogging.store(false);
-    stopTimer();
     drainLogFifo();
+}
+
+void AudioPluginAudioProcessor::clearLog()
+{
+    if (isLogging.load())
+        return;
+
+    drainLogFifo();
+    dataLog.clear();
+    droppedLogPoints.store(0);
+    currentRating.store(0);
+    ratingCount.store(0);
+}
+
+void AudioPluginAudioProcessor::submitRating(int rating)
+{
+    if (!isLogging.load() || rating < 1 || rating > 7)
+        return;
+
+    currentRating.store(rating);
+    ratingEventPending.store(true);
+    ratingCount.fetch_add(1);
+}
+
+void AudioPluginAudioProcessor::timerCallback()
+{
+    drainLogFifo();
+
+    // Auto-record: start once when audio first arrives (re-armed by prepareToPlay or by
+    // switching the option off and on); stopping is always manual
+    if (autoRecordValue->load() > 0.5f)
+    {
+        if (!isLogging.load() && signalSeen.load() && !autoRecordFired.load())
+        {
+            autoRecordFired.store(true);
+            startLogging();
+        }
+    }
+    else
+    {
+        autoRecordFired.store(false);
+    }
 }
 
 void AudioPluginAudioProcessor::logDataPoint()
@@ -526,17 +665,20 @@ void AudioPluginAudioProcessor::logDataPoint()
         return;
     }
 
-    DataPoint& point = logFifoStorage[static_cast<size_t>(start1)];
+    LogDataPoint& point = logFifoStorage[static_cast<size_t>(start1)];
     point.timestamp = static_cast<double>(samplesProcessed - loggingStartSample.load()) / currentSampleRate;
     point.activationScore = acousticActivationScore.load();
-    point.spectralCentroid = spectralCentroid.load();
-    point.spectralHarshness = spectralHarshness.load();
+    point.brightness = spectralCentroid.load();
+    point.harshness = spectralHarshness.load();
     point.dynamicVariability = dynamicVariability.load();
     point.temporalUnpredictability = temporalUnpredictability.load();
     point.rmsLevel = rmsLevel.load();
     point.loudnessSones = loudnessSones.load();
     point.sharpnessAcum = sharpnessAcum.load();
     point.roughnessAsper = roughnessAsper.load();
+    point.stereoWidth = stereoWidth.load();
+    point.listenerRating = currentRating.load();
+    point.ratingEvent = ratingEventPending.exchange(false) ? 1 : 0;
 
     logFifo.finishedWrite(1);
 }
@@ -563,75 +705,41 @@ double AudioPluginAudioProcessor::getRecordingTime() const
     return static_cast<double>(samplesProcessedPublished.load() - loggingStartSample.load()) / currentSampleRate;
 }
 
-void AudioPluginAudioProcessor::exportToCSV()
+std::vector<LogDataPoint> AudioPluginAudioProcessor::getLogSnapshot()
 {
     drainLogFifo(); // Pick up anything the audio thread logged since the last drain
+    return dataLog;
+}
 
-    if (dataLog.empty())
-    {
-        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
-            "No Data",
-            "No data to export. Please record data first.",
-            "OK");
-        return;
-    }
+LogMetadata AudioPluginAudioProcessor::getLogMetadata() const
+{
+    LogMetadata metadata;
+    metadata.pluginName = getName();
+#if defined(JucePlugin_VersionString)
+    metadata.pluginVersion = JucePlugin_VersionString;
+#else
+    metadata.pluginVersion = "dev";
+#endif
+    metadata.sampleRate = currentSampleRate;
+    metadata.analysedChannels = analysisChannels;
+    metadata.frameRateHz = currentSampleRate / hopSize;
+    metadata.calibrationSpl = calibrationSplValue->load();
 
-    // Create CSV content first (before the async callback)
-    juce::String csvContent = "Timestamp_Seconds,Activation_Score,Brightness,Harshness,Dynamic_Variability,Temporal_Unpredictability,RMS_Level,Loudness_Sone,Sharpness_Acum,Roughness_Asper\n";
+    // Shares of the index in percent; all-zero weights fall back to equal shares
+    const float weights[] = { weightBrightnessValue->load(), weightHarshnessValue->load(),
+                              weightDynamicsValue->load(), weightUnpredictabilityValue->load() };
+    const float total = weights[0] + weights[1] + weights[2] + weights[3];
+    auto share = [total](float weight) { return total > 0.0f ? 100.0f * weight / total : 25.0f; };
 
-    for (const auto& point : dataLog)
-    {
-        csvContent += juce::String(point.timestamp, 3) + ",";
-        csvContent += juce::String(point.activationScore, 2) + ",";
-        csvContent += juce::String(point.spectralCentroid, 4) + ",";
-        csvContent += juce::String(point.spectralHarshness, 4) + ",";
-        csvContent += juce::String(point.dynamicVariability, 4) + ",";
-        csvContent += juce::String(point.temporalUnpredictability, 4) + ",";
-        csvContent += juce::String(point.rmsLevel, 6) + ",";
-        csvContent += juce::String(point.loudnessSones, 3) + ",";
-        csvContent += juce::String(point.sharpnessAcum, 3) + ",";
-        csvContent += juce::String(point.roughnessAsper, 3) + "\n";
-    }
+    metadata.weightBrightness = share(weights[0]);
+    metadata.weightHarshness = share(weights[1]);
+    metadata.weightDynamics = share(weights[2]);
+    metadata.weightUnpredictability = share(weights[3]);
 
-    int totalPoints = static_cast<int>(dataLog.size());
-    int droppedPoints = droppedLogPoints.load();
-
-    // Create file chooser on the heap (it will manage its own lifetime)
-    auto chooser = std::make_shared<juce::FileChooser>(
-        "Save CSV File",
-        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("acoustic_data.csv"),
-        "*.csv");
-
-    auto flags = juce::FileBrowserComponent::saveMode
-        | juce::FileBrowserComponent::canSelectFiles
-        | juce::FileBrowserComponent::warnAboutOverwriting;
-
-    chooser->launchAsync(flags, [csvContent, totalPoints, droppedPoints, chooser](const juce::FileChooser& fc)
-        {
-            auto result = fc.getURLResult();
-            auto outputFile = result.getLocalFile();
-
-            if (outputFile != juce::File{})
-            {
-                // Write to file
-                if (outputFile.replaceWithText(csvContent))
-                {
-                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
-                        "Export Successful",
-                        "Data exported to:\n" + outputFile.getFullPathName() +
-                        "\n\nTotal data points: " + juce::String(totalPoints) +
-                        (droppedPoints > 0 ? "\nDropped (buffer overflow): " + juce::String(droppedPoints) : juce::String()),
-                        "OK");
-                }
-                else
-                {
-                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
-                        "Export Failed",
-                        "Failed to write file. Check permissions.",
-                        "OK");
-                }
-            }
-        });
+    metadata.smoothingAttackMs = smoothingAttackValue->load();
+    metadata.smoothingReleaseMs = smoothingReleaseValue->load();
+    metadata.droppedPoints = droppedLogPoints.load();
+    return metadata;
 }
 
 juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()
@@ -641,12 +749,18 @@ juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()
 
 void AudioPluginAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
-    // Save state if needed
+    auto state = apvts.copyState();
+    state.setProperty("stateVersion", 1, nullptr); // For migrating older projects later
+
+    if (auto xml = state.createXml())
+        copyXmlToBinary(*xml, destData);
 }
 
 void AudioPluginAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
-    // Restore state if needed
+    if (auto xml = getXmlFromBinary(data, sizeInBytes))
+        if (xml->hasTagName(apvts.state.getType()))
+            apvts.replaceState(juce::ValueTree::fromXml(*xml));
 }
 
 

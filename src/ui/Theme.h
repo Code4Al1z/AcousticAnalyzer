@@ -4,31 +4,52 @@
 
 namespace ui
 {
-    // Colours. Surfaces and text tokens are for the dark theme; the categorical
-    // series colours are a fixed-order set validated (lightness band, chroma,
-    // colour-blind separation, contrast) against the dark surface.
+    // Colours: the TrailblaiZ brand palette. Surfaces and text are brand neutrals and
+    // purples; the data colours are the brand hues, in a fixed order.
+    //
+    // Checked with the data-viz palette validator against the surface: the five series
+    // colours pass chroma, colour-blind separation (worst neighbours: dE 18.7 where 8 is
+    // the target), normal-vision separation and 3:1 contrast. They fail only the
+    // validator's "lightness band", because the neon brand hues are brighter than its
+    // recommended range. That is a visual-balance guideline, not a legibility one.
+    // The brand has four data hues, so the fifth series (the rating) is a derived yellow.
     namespace palette
     {
-        inline const juce::Colour window        { 0xff121211 };
-        inline const juce::Colour surface       { 0xff1a1a19 };
-        inline const juce::Colour surfaceRaised { 0xff262624 };
-        inline const juce::Colour outline       { 0xff32322f };
-        inline const juce::Colour grid          { 0xff2c2c2a };
+        // Surfaces
+        inline const juce::Colour window        { 0xff0a0a0f };
+        inline const juce::Colour surface       { 0xff151520 };
+        inline const juce::Colour surfaceRaised { 0xff2d1b4e }; // Brand "Russian Violet"
+        inline const juce::Colour outline       { 0xff2a2a35 };
+        inline const juce::Colour grid          { 0xff22222d };
 
-        inline const juce::Colour textPrimary   { 0xffffffff };
-        inline const juce::Colour textSecondary { 0xffc3c2b7 };
-        inline const juce::Colour textMuted     { 0xff8c8b82 };
+        // Text (all at least 4.5:1 on the surface and on the raised surface)
+        inline const juce::Colour textPrimary   { 0xffe8e8f0 };
+        inline const juce::Colour textSecondary { 0xffb9b9cb };
+        inline const juce::Colour textMuted     { 0xff9393ab };
 
-        // Categorical series, in this order, never cycled
-        inline const juce::Colour seriesBlue    { 0xff3987e5 };
-        inline const juce::Colour seriesOrange  { 0xffd95926 };
-        inline const juce::Colour seriesAqua    { 0xff199e70 };
-        inline const juce::Colour seriesYellow  { 0xffc98500 };
+        // Brand hues
+        inline const juce::Colour brandOrange   { 0xffff5e00 };
+        inline const juce::Colour brandPink     { 0xffff2e88 };
+        inline const juce::Colour brandCyan     { 0xff00e5ff };
+        inline const juce::Colour brandViolet   { 0xff6b4fff };
 
-        // Status colours are reserved for state and always come with an icon and a label
-        inline const juce::Colour good          { 0xff0ca30c };
-        inline const juce::Colour warning       { 0xfffab219 };
-        inline const juce::Colour critical      { 0xffd03b3b };
+        // Interactive accent: focus, toggled buttons, selection
+        inline const juce::Colour accent        = brandCyan;
+
+        // Data series, in this order, never cycled
+        inline const juce::Colour seriesCyan    = brandCyan;
+        inline const juce::Colour seriesOrange  = brandOrange;
+        inline const juce::Colour seriesViolet  = brandViolet;
+        inline const juce::Colour seriesPink    = brandPink;
+        inline const juce::Colour seriesYellow  { 0xffffc400 }; // Derived: the brand has no fifth hue
+
+        // Gauge zones and recording. Always shown with an icon and a label, never colour alone.
+        inline const juce::Colour good          = brandCyan;    // Low activation, calming
+        inline const juce::Colour warning       = brandViolet;  // Medium activation, neutral
+        inline const juce::Colour critical      = brandPink;    // High activation, stimulating; also "recording"
+
+        // The brand gradient, orange to pink, for t from 0 to 1
+        inline juce::Colour brandGradient(float t) { return brandOrange.interpolatedWith(brandPink, juce::jlimit(0.0f, 1.0f, t)); }
     }
 
     inline juce::Font font(float size, bool bold = false)
@@ -81,6 +102,33 @@ namespace ui
             setColour(juce::TextButton::buttonOnColourId, palette::surfaceRaised);
             setColour(juce::TextButton::textColourOffId, palette::textPrimary);
             setColour(juce::TextButton::textColourOnId, palette::textPrimary);
+
+            setColour(juce::Slider::textBoxTextColourId, palette::textPrimary);
+            setColour(juce::Slider::textBoxBackgroundColourId, palette::surfaceRaised);
+            setColour(juce::Slider::textBoxOutlineColourId, palette::outline);
+            setColour(juce::Slider::textBoxHighlightColourId, palette::accent.withAlpha(0.4f));
+            setColour(juce::Label::textColourId, palette::textSecondary);
+
+            setColour(juce::ComboBox::backgroundColourId, palette::surfaceRaised);
+            setColour(juce::ComboBox::textColourId, palette::textPrimary);
+            setColour(juce::ComboBox::outlineColourId, palette::outline);
+            setColour(juce::ComboBox::arrowColourId, palette::textSecondary);
+            setColour(juce::ComboBox::focusedOutlineColourId, palette::accent);
+            setColour(juce::PopupMenu::backgroundColourId, palette::surfaceRaised);
+            setColour(juce::PopupMenu::textColourId, palette::textPrimary);
+            setColour(juce::PopupMenu::highlightedBackgroundColourId, palette::accent.withAlpha(0.3f));
+            setColour(juce::PopupMenu::highlightedTextColourId, palette::textPrimary);
+
+            setColour(juce::ToggleButton::textColourId, palette::textPrimary);
+            setColour(juce::ToggleButton::tickColourId, palette::accent);
+            setColour(juce::ToggleButton::tickDisabledColourId, palette::textMuted);
+
+            setColour(juce::ListBox::backgroundColourId, juce::Colours::transparentBlack);
+            setColour(juce::ListBox::outlineColourId, juce::Colours::transparentBlack);
+            setColour(juce::TableHeaderComponent::backgroundColourId, palette::surfaceRaised);
+            setColour(juce::TableHeaderComponent::textColourId, palette::textSecondary);
+            setColour(juce::TableHeaderComponent::outlineColourId, palette::outline);
+            setColour(juce::TableHeaderComponent::highlightColourId, palette::surfaceRaised);
         }
 
         juce::Font getTextButtonFont(juce::TextButton&, int) override { return font(14.0f, true); }
@@ -100,8 +148,38 @@ namespace ui
 
             g.setColour(fill);
             g.fillRoundedRectangle(bounds, 8.0f);
-            g.setColour(palette::outline);
-            g.drawRoundedRectangle(bounds, 8.0f, 1.0f);
+
+            // A toggled-on button (e.g. Settings) gets an accent outline
+            g.setColour(button.getToggleState() ? palette::accent : palette::outline);
+            g.drawRoundedRectangle(bounds, 8.0f, button.getToggleState() ? 1.5f : 1.0f);
+        }
+
+        // Thin track, accent fill, round thumb with a surface ring
+        void drawLinearSlider(juce::Graphics& g, int x, int y, int width, int height, float sliderPos,
+                              float minSliderPos, float maxSliderPos, juce::Slider::SliderStyle style,
+                              juce::Slider& slider) override
+        {
+            if (style != juce::Slider::LinearHorizontal)
+            {
+                juce::LookAndFeel_V4::drawLinearSlider(g, x, y, width, height, sliderPos, minSliderPos, maxSliderPos, style, slider);
+                return;
+            }
+
+            const float centreY = static_cast<float>(y) + static_cast<float>(height) * 0.5f;
+            const auto track = juce::Rectangle<float>(static_cast<float>(x), centreY - 2.0f, static_cast<float>(width), 4.0f);
+
+            g.setColour(palette::surfaceRaised);
+            g.fillRoundedRectangle(track, 2.0f);
+
+            if (slider.isEnabled())
+                g.setGradientFill(juce::ColourGradient(palette::brandOrange, track.getX(), 0.0f,
+                                                       palette::brandPink, track.getRight(), 0.0f, false));
+            else
+                g.setColour(palette::textMuted);
+
+            g.fillRoundedRectangle(track.withRight(sliderPos), 2.0f);
+
+            drawRingedDot(g, { sliderPos, centreY }, 7.0f, palette::textPrimary);
         }
     };
 }

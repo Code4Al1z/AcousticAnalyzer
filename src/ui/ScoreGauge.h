@@ -10,9 +10,6 @@ namespace ui
     class ScoreGauge : public juce::Component
     {
     public:
-        static constexpr float calmThreshold = 70.0f;    // Above this: low activation
-        static constexpr float neutralThreshold = 40.0f; // Above this: medium activation
-
         ScoreGauge()
         {
             setTitle("Acoustic activation index");
@@ -27,7 +24,35 @@ namespace ui
                 return;
 
             score = newScore;
-            setDescription(juce::String(score, 1) + " out of 100. " + zoneFor(score).label);
+            setDescription(juce::String(score, 1) + " out of 100. " + zoneFor(score).label + ". Experimental index, not yet validated.");
+            repaint();
+        }
+
+        // Where the zones change: above `calm` is low activation, above `neutral`
+        // is medium. `calm` is kept above `neutral`.
+        void setThresholds(float newCalm, float newNeutral)
+        {
+            newNeutral = juce::jlimit(0.0f, 99.0f, newNeutral);
+            newCalm = juce::jlimit(newNeutral + 1.0f, 100.0f, newCalm);
+
+            if (juce::approximatelyEqual(newCalm, calmThreshold) && juce::approximatelyEqual(newNeutral, neutralThreshold))
+                return;
+
+            calmThreshold = newCalm;
+            neutralThreshold = newNeutral;
+            setDescription(juce::String(score, 1) + " out of 100. " + zoneFor(score).label + ". Experimental index, not yet validated.");
+            repaint();
+        }
+
+        // No audio yet, or digital silence: show a dash instead of a number that would be a guess
+        void setNoSignal(bool shouldShowNoSignal)
+        {
+            if (shouldShowNoSignal == noSignal)
+                return;
+
+            noSignal = shouldShowNoSignal;
+            setDescription(noSignal ? juce::String("No signal")
+                                    : juce::String(score, 1) + " out of 100. " + zoneFor(score).label + ". Experimental index, not yet validated.");
             repaint();
         }
 
@@ -44,7 +69,7 @@ namespace ui
 
             constexpr float startAngle = -2.0f * juce::MathConstants<float>::pi / 3.0f; // 240 degree sweep, opening at the bottom
             constexpr float sweep = 4.0f * juce::MathConstants<float>::pi / 3.0f;
-            const auto zone = zoneFor(score);
+            const auto zone = noSignal ? Zone{ palette::textMuted, "No signal", Icon::none } : zoneFor(score);
 
             // Track
             juce::Path track;
@@ -53,7 +78,7 @@ namespace ui
             g.strokePath(track, juce::PathStrokeType(thickness, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 
             // Value
-            if (score > 0.5f)
+            if (!noSignal && score > 0.5f)
             {
                 juce::Path value;
                 value.addCentredArc(centre.x, centre.y, radius, radius, 0.0f, startAngle,
@@ -73,14 +98,14 @@ namespace ui
             }
 
             // Number and caption
-            auto textArea = juce::Rectangle<float>(radius * 1.5f, radius * 1.1f).withCentre(centre.translated(0.0f, radius * 0.05f));
-            g.setColour(palette::textPrimary);
+            auto textArea = juce::Rectangle<float>(radius * 1.8f, radius * 1.1f).withCentre(centre.translated(0.0f, radius * 0.05f));
+            g.setColour(noSignal ? palette::textMuted : palette::textPrimary);
             g.setFont(font(juce::jlimit(24.0f, 64.0f, radius * 0.62f), true));
-            g.drawText(juce::String(score, 1), textArea.removeFromTop(textArea.getHeight() * 0.65f),
+            g.drawText(noSignal ? juce::String("--") : juce::String(score, 1), textArea.removeFromTop(textArea.getHeight() * 0.65f),
                        juce::Justification::centredBottom);
 
             g.setColour(palette::textMuted);
-            g.setFont(font(juce::jlimit(10.0f, 13.0f, radius * 0.14f)));
+            g.setFont(font(juce::jlimit(9.0f, 13.0f, radius * 0.13f)));
             g.drawText("ACTIVATION INDEX", textArea, juce::Justification::centredTop);
 
             // Zone: icon + label
@@ -97,7 +122,7 @@ namespace ui
         }
 
     private:
-        enum class Icon { check, alert, cross };
+        enum class Icon { check, alert, cross, none };
 
         struct Zone
         {
@@ -106,7 +131,7 @@ namespace ui
             Icon icon;
         };
 
-        static Zone zoneFor(float s)
+        Zone zoneFor(float s) const
         {
             if (s > calmThreshold)    return { palette::good,     "Low activation - calming",       Icon::check };
             if (s > neutralThreshold) return { palette::warning,  "Medium activation - neutral",    Icon::alert };
@@ -142,6 +167,11 @@ namespace ui
                     g.fillEllipse(juce::Rectangle<float>(2.4f, 2.4f).withCentre({ c.x, c.y + 5.0f }));
                     break;
                 }
+                case Icon::none: // Hollow circle: nothing to report
+                {
+                    g.drawEllipse(juce::Rectangle<float>(r * 2 - 3.0f, r * 2 - 3.0f).withCentre(c), 1.5f);
+                    break;
+                }
                 case Icon::cross:
                 {
                     g.fillRoundedRectangle(juce::Rectangle<float>(r * 2, r * 2).withCentre(c), 3.0f);
@@ -154,5 +184,8 @@ namespace ui
         }
 
         float score = 0.0f;
+        bool noSignal = false;
+        float calmThreshold = 70.0f;
+        float neutralThreshold = 40.0f;
     };
 }
