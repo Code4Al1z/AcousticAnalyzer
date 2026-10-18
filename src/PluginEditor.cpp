@@ -86,6 +86,9 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor(AudioPluginAudi
     historyTable.setVisible(false);
     setWantsKeyboardFocus(true);
 
+    supportFooter.getDiagnostics = [this]() { return buildDiagnostics(); };
+    addAndMakeVisible(supportFooter);
+
     addChildComponent(settingsPanel); // On top of the graph and band view, hidden until Settings is pressed
 
     // Restore what was saved with the project: window size and hidden graph series
@@ -223,7 +226,8 @@ void AudioPluginAudioProcessorEditor::resized()
     headerArea = area.removeFromTop(36);
     area.removeFromTop(gap);
 
-    disclaimerArea = area.removeFromBottom(16);
+    disclaimerArea = area.removeFromBottom(20);
+    supportFooter.setBounds(disclaimerArea.removeFromRight(ui::SupportFooter::preferredWidth()));
     area.removeFromBottom(6);
 
     auto footer = area.removeFromBottom(36);
@@ -484,6 +488,33 @@ bool AudioPluginAudioProcessorEditor::keyPressed(const juce::KeyPress& key)
 juce::ValueTree AudioPluginAudioProcessorEditor::getUiState() const
 {
     return processor.apvts.state.getOrCreateChildWithName("ui", nullptr);
+}
+
+// The "details" block of a bug report: what is needed to reproduce a problem, and nothing personal
+juce::String AudioPluginAudioProcessorEditor::buildDiagnostics() const
+{
+#ifdef JucePlugin_VersionString
+    const juce::String version = JucePlugin_VersionString;
+#else
+    const juce::String version = "development build";
+#endif
+
+    auto setting = [this](const char* id) { return processor.apvts.getRawParameterValue(id)->load(); };
+
+    juce::StringArray lines;
+    lines.add("Acoustic Analyzer " + version + " (" + juce::AudioProcessor::getWrapperTypeDescription(processor.wrapperType) + ")");
+    lines.add("Host: " + juce::String(juce::PluginHostType().getHostDescription()));
+    lines.add("System: " + juce::SystemStats::getOperatingSystemName());
+    lines.add("Audio: " + juce::String(processor.getSampleRate(), 0) + " Hz, block size " + juce::String(processor.getBlockSize())
+              + ", " + juce::String(processor.getTotalNumInputChannels()) + " in / " + juce::String(processor.getTotalNumOutputChannels()) + " out");
+    lines.add("Calibration: " + juce::String(setting(params::calibrationSpl), 0) + " dB SPL at 0 dBFS");
+    lines.add("Weights (brightness / harshness / dynamics / unpredictability): "
+              + juce::String(setting(params::weightBrightness), 0) + " / " + juce::String(setting(params::weightHarshness), 0) + " / "
+              + juce::String(setting(params::weightDynamics), 0) + " / " + juce::String(setting(params::weightUnpredictability), 0));
+    lines.add("Smoothing: " + juce::String(setting(params::smoothingAttack), 0) + " / " + juce::String(setting(params::smoothingRelease), 0) + " ms");
+    lines.add("Recording: " + juce::String(processor.isCurrentlyLogging() ? "yes" : "no")
+              + ", " + juce::String(processor.getDataPointCount()) + " points");
+    return lines.joinIntoString("\n");
 }
 
 void AudioPluginAudioProcessorEditor::startExport()

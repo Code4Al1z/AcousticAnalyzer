@@ -8,6 +8,7 @@
 #include "ui/RatingStrip.h"
 #include "ui/ScoreGauge.h"
 #include "ui/SettingsPanel.h"
+#include "ui/SupportFooter.h"
 #include "ui/Theme.h"
 #include "ui/Widgets.h"
 
@@ -33,6 +34,7 @@ private:
     void updateRatingSummary();
     void confirmClear();
     void startExport();
+    juce::String buildDiagnostics() const;
     juce::ValueTree getUiState() const;
     static juce::String formatTime(double seconds);
 
@@ -64,6 +66,7 @@ private:
     juce::Label statusLabel;
     PresetStore presetStore;
     ui::SettingsPanel settingsPanel{ processor.apvts, presetStore };
+    ui::SupportFooter supportFooter;
 
     std::unique_ptr<juce::FileChooser> fileChooser; // Must outlive the async dialog
 
