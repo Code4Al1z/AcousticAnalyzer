@@ -1,10 +1,15 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(AcousticAnalyzer VERSION 0.0.1)
+project(AcousticAnalyzer VERSION 0.9.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Link the Microsoft C++ runtime statically (Release) so the plugin runs on a PC that does not have
+# the Visual C++ Redistributable installed. Must be set before any target is created, which
+# includes the JUCE targets added below.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # ------------------------------------------------------------------------------
 # JUCE

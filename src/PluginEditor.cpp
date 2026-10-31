@@ -167,7 +167,7 @@ void AudioPluginAudioProcessorEditor::paint(juce::Graphics& g)
     g.drawText("Acoustic Analyzer", headerArea.withTrimmedLeft(16), juce::Justification::centredLeft);
 
     const auto betaFont = ui::font(11.0f, true);
-    const auto betaWidth = static_cast<float>(ui::textWidth(betaFont, "BETA v0.1")) + 18.0f;
+    const auto betaWidth = static_cast<float>(ui::textWidth(betaFont, "BETA v0.9.0")) + 18.0f;
     const auto beta = juce::Rectangle<float>(betaWidth, 22.0f)
                           .withRightX(static_cast<float>(headerArea.getRight()))
                           .withCentre({ static_cast<float>(headerArea.getRight()) - betaWidth * 0.5f, static_cast<float>(headerArea.getCentreY()) });
@@ -175,7 +175,7 @@ void AudioPluginAudioProcessorEditor::paint(juce::Graphics& g)
     g.drawRoundedRectangle(beta.reduced(0.5f), 11.0f, 1.0f);
     g.setColour(ui::palette::textSecondary);
     g.setFont(betaFont);
-    g.drawText("BETA v0.1", beta, juce::Justification::centred);
+    g.drawText("BETA v0.9.0", beta, juce::Justification::centred);
 
     // Panels and their titles
     const int window = history.getWindowSeconds();
